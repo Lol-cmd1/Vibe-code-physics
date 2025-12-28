@@ -37,7 +37,7 @@ function run(Player)
 			end
 		end
 
-		Spring = requireStuff("https://raw.githubusercontent.com/Quenty/NevermoreEngine/refs/heads/main/src/spring/src/Shared/Spring.lua","Spring")
+		Spring = requireStuff("https://raw.githubusercontent.com/Lol-cmd1/Vibe-code-physics/refs/heads/main/Springs","Spring")
 	end
 
 
