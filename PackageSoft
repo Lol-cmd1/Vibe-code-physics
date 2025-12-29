@@ -3683,49 +3683,61 @@ UIS.InputBegan:Connect(function(input, gameProcessed)
     end
 end)
 
+local RunService = game:GetService("RunService")
+
 local SOFTBODY_ASSET_ID = "rbxassetid://7606070501"
+local Softbody = {}
 
-local SoftbodySprings = {}
+local Spring = require(script:WaitForChild("Spring"))
 
-local function applySoftbody(part)
-	if SoftbodySprings[part] then return end
-	local mesh = part:FindFirstChildWhichIsA("SpecialMesh")
-	if not mesh or mesh.MeshId ~= SOFTBODY_ASSET_ID then return end
+local function attach(part)
+	if Softbody[part] then return end
+	if not part:IsA("MeshPart") then return end
+	if part.MeshId ~= SOFTBODY_ASSET_ID then return end
 
-	local Spring = require(script:WaitForChild("Spring"))
+	local sx = Spring.new(0)
+	local sy = Spring.new(0)
+	local sz = Spring.new(0)
 
-	local springX = Spring.new(0)
-	local springY = Spring.new(0)
-	local springZ = Spring.new(0)
+	sx.Speed *= 0.9
+	sy.Speed *= 0.6
+	sz.Speed *= 0.9
 
-	springX.Speed = springX.Speed * 0.9
-	springY.Speed = springY.Speed * 0.6
-	springZ.Speed = springZ.Speed * 0.9
+	sx.Damper *= 1.1
+	sy.Damper *= 1.4
+	sz.Damper *= 1.1
 
-	springX.Damper = springX.Damper * 1.1
-	springY.Damper = springY.Damper * 1.4
-	springZ.Damper = springZ.Damper * 1.1
-
-	SoftbodySprings[part] = {
-		x = springX,
-		y = springY,
-		z = springZ,
-		lastVelY = 0,
-		origin = part.CFrame
+	Softbody[part] = {
+		x = sx,
+		y = sy,
+		z = sz,
+		lastY = 0
 	}
 end
 
-game:GetService("RunService").RenderStepped:Connect(function()
-	for part, data in pairs(SoftbodySprings) do
+for _, d in ipairs(workspace:GetDescendants()) do
+	if d:IsA("BasePart") then
+		attach(d)
+	end
+end
+
+workspace.DescendantAdded:Connect(function(d)
+	if d:IsA("BasePart") then
+		attach(d)
+	end
+end)
+
+RunService:BindToRenderStep("SoftbodyLate", Enum.RenderPriority.Last.Value, function()
+	for part, data in pairs(Softbody) do
 		if not part.Parent then
-			SoftbodySprings[part] = nil
+			Softbody[part] = nil
 		else
 			local vel = part.AssemblyLinearVelocity
-			local impact = math.max(0, data.lastVelY - vel.Y)
-			data.lastVelY = vel.Y
+			local impact = math.max(0, data.lastY - vel.Y)
+			data.lastY = vel.Y
 
 			data.x.Target = vel.X * 0.002
-			data.y.Target = vel.Y * 0.003 - impact * 0.004
+			data.y.Target = vel.Y * 0.003 - impact * 0.005
 			data.z.Target = vel.Z * 0.002
 
 			local offset = Vector3.new(
@@ -3734,19 +3746,7 @@ game:GetService("RunService").RenderStepped:Connect(function()
 				data.z.Position
 			)
 
-			part.CFrame = data.origin * CFrame.new(offset)
+			part.CFrame = part.CFrame * CFrame.new(offset)
 		end
-	end
-end)
-
-for _, obj in ipairs(workspace:GetDescendants()) do
-	if obj:IsA("BasePart") then
-		applySoftbody(obj)
-	end
-end
-
-workspace.DescendantAdded:Connect(function(obj)
-	if obj:IsA("BasePart") then
-		applySoftbody(obj)
 	end
 end)
