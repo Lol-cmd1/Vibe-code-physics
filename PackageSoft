@@ -3686,29 +3686,31 @@ end)
 local RunService = game:GetService("RunService")
 local Spring = require(script:WaitForChild("Spring"))
 
-local Softbody = {}
+local SoftScale = {}
 
 local function attach(part)
-	if Softbody[part] then return end
-	if not part:IsA("MeshPart") then return end
+	if SoftScale[part] then return end
+	if not part:IsA("BasePart") then return end
+	if part:IsA("MeshPart") == false then return end
 
-	local sx = Spring.new(0)
-	local sy = Spring.new(0)
-	local sz = Spring.new(0)
+	local sx = Spring.new(1)
+	local sy = Spring.new(1)
+	local sz = Spring.new(1)
 
-	sx.Speed = sx.Speed * 0.9
-	sy.Speed = sy.Speed * 0.6
-	sz.Speed = sz.Speed * 0.9
+	sx.Speed = sx.Speed * 0.8
+	sy.Speed = sy.Speed * 0.55
+	sz.Speed = sz.Speed * 0.8
 
-	sx.Damper = sx.Damper * 1.1
-	sy.Damper = sy.Damper * 1.4
-	sz.Damper = sz.Damper * 1.1
+	sx.Damper = sx.Damper * 1.2
+	sy.Damper = sy.Damper * 1.5
+	sz.Damper = sz.Damper * 1.2
 
-	Softbody[part] = {
+	SoftScale[part] = {
 		x = sx,
 		y = sy,
 		z = sz,
-		lastY = 0
+		lastY = 0,
+		orig = part.Size
 	}
 end
 
@@ -3724,26 +3726,26 @@ workspace.DescendantAdded:Connect(function(d)
 	end
 end)
 
-RunService:BindToRenderStep("SoftbodyDebugLate", Enum.RenderPriority.Last.Value, function()
-	for part, data in pairs(Softbody) do
+RunService.RenderStepped:Connect(function(dt)
+	for part, data in pairs(SoftScale) do
 		if not part.Parent then
-			Softbody[part] = nil
+			SoftScale[part] = nil
 		else
 			local vel = part.AssemblyLinearVelocity
 			local impact = math.max(0, data.lastY - vel.Y)
 			data.lastY = vel.Y
 
-			data.x.Target = vel.X * 0.003
-			data.y.Target = vel.Y * 0.004 - impact * 0.006
-			data.z.Target = vel.Z * 0.003
+			data.x.Target = 1 + math.clamp(math.abs(vel.X) * 0.002, 0, 0.04)
+			data.z.Target = 1 + math.clamp(math.abs(vel.Z) * 0.002, 0, 0.04)
+			data.y.Target = 1 - math.clamp(impact * 0.003, 0, 0.08)
 
-			local offset = Vector3.new(
+			local scale = Vector3.new(
 				data.x.Position,
 				data.y.Position,
 				data.z.Position
 			)
 
-			part.CFrame = part.CFrame * CFrame.new(offset)
+			part.Size = data.orig * scale
 		end
 	end
 end)
