@@ -3694,24 +3694,47 @@ local function applySoftbody(part)
 
 	local Spring = require(script:WaitForChild("Spring"))
 
-	local sbSpring = Spring.new(Vector3.zero)
-	sbSpring.Speed = sbSpring.Speed * 0.65
-	sbSpring.Damper = sbSpring.Damper * 1.35
+	local springX = Spring.new(0)
+	local springY = Spring.new(0)
+	local springZ = Spring.new(0)
+
+	springX.Speed = springX.Speed * 0.9
+	springY.Speed = springY.Speed * 0.6
+	springZ.Speed = springZ.Speed * 0.9
+
+	springX.Damper = springX.Damper * 1.1
+	springY.Damper = springY.Damper * 1.4
+	springZ.Damper = springZ.Damper * 1.1
 
 	SoftbodySprings[part] = {
-		spring = sbSpring,
+		x = springX,
+		y = springY,
+		z = springZ,
+		lastVelY = 0,
 		origin = part.CFrame
 	}
 end
 
 game:GetService("RunService").RenderStepped:Connect(function()
 	for part, data in pairs(SoftbodySprings) do
-		if part.Parent == nil then
+		if not part.Parent then
 			SoftbodySprings[part] = nil
 		else
 			local vel = part.AssemblyLinearVelocity
-			data.spring.Target = vel * 0.002
-			part.CFrame = data.origin * CFrame.new(data.spring.Position)
+			local impact = math.max(0, data.lastVelY - vel.Y)
+			data.lastVelY = vel.Y
+
+			data.x.Target = vel.X * 0.002
+			data.y.Target = vel.Y * 0.003 - impact * 0.004
+			data.z.Target = vel.Z * 0.002
+
+			local offset = Vector3.new(
+				data.x.Position,
+				data.y.Position,
+				data.z.Position
+			)
+
+			part.CFrame = data.origin * CFrame.new(offset)
 		end
 	end
 end)
