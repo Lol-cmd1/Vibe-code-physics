@@ -1,0 +1,129 @@
+
+--!strict
+
+local Spring = {}
+Spring.__index = Spring
+
+export type SpringClock = () -> number
+
+function Spring.new<T>(initial: T?, clock: SpringClock?)
+	local p0 = initial or 0
+	local springClock = clock or os.clock
+
+	local seed = math.random()
+	local asym = (seed - 0.5) * 0.15
+
+	return setmetatable({
+		_clock = springClock,
+		_time0 = springClock(),
+		_position0 = p0,
+		_velocity0 = 0 * (p0 :: any),
+		_target = p0,
+		_damper = 0.12 + asym * 0.15,
+		_speed = 4.2 + asym,
+		_asym = asym,
+	} :: any, Spring)
+end
+
+function Spring.Impulse<T>(self, velocity: T)
+	self.Velocity = (self.Velocity :: any) + velocity
+end
+
+function Spring.TimeSkip<T>(self, delta: number)
+	local now = self._clock()
+	local position, velocity = self:_positionVelocity(now + delta)
+	self._position0 = position
+	self._velocity0 = velocity
+	self._time0 = now
+end
+
+function Spring.SetTarget<T>(self, value: T, doNotAnimate: boolean?)
+	if doNotAnimate then
+		local now = self._clock()
+		self._position0 = value
+		self._velocity0 = 0 * (value :: any)
+		self._target = value
+		self._time0 = now
+	else
+		self.Target = value
+	end
+end
+
+(Spring :: any).__index = function(self, index)
+	if Spring[index] then
+		return Spring[index]
+	elseif index == "Value" or index == "Position" or index == "p" then
+		return self:_positionVelocity(self._clock())
+	elseif index == "Velocity" or index == "v" then
+		local _, v = self:_positionVelocity(self._clock())
+		return v
+	elseif index == "Target" or index == "t" then
+		return self._target
+	elseif index == "Damper" or index == "d" then
+		return self._damper
+	elseif index == "Speed" or index == "s" then
+		return self._speed
+	elseif index == "Clock" then
+		return self._clock
+	else
+		error(string.format("%q is not a valid member of Spring", tostring(index)), 2)
+	end
+end
+
+function Spring.__newindex(self, index, value)
+	local now = self._clock()
+	local p, v = self:_positionVelocity(now)
+
+	if index == "Value" or index == "Position" or index == "p" then
+		self._position0 = value
+		self._velocity0 = v
+	elseif index == "Velocity" or index == "v" then
+		self._position0 = p
+		self._velocity0 = value
+	elseif index == "Target" or index == "t" then
+		self._position0 = p
+		self._velocity0 = v
+		self._target = value
+	elseif index == "Damper" or index == "d" then
+		self._position0 = p
+		self._velocity0 = v
+		self._damper = value
+	elseif index == "Speed" or index == "s" then
+		self._position0 = p
+		self._velocity0 = v
+		self._speed = math.max(0, value)
+	elseif index == "Clock" then
+		self._position0 = p
+		self._velocity0 = v
+		self._clock = value
+		self._time0 = value()
+	end
+
+	self._time0 = now
+end
+
+function Spring._positionVelocity(self, now)
+	local p0 = self._position0
+	local v0 = self._velocity0
+	local p1 = self._target
+
+	local d = self._damper
+	local s = self._speed
+
+	local dt = math.clamp(now - self._time0, 0, 1/30)
+
+	local k = s * s
+	local c = 2 * d * s
+
+	local x = p0 - p1
+	local a = (-k * x) - (c * v0)
+
+	local inertia = math.exp(-dt / (0.45 + math.abs(self._asym)))
+
+	local v = (v0 + a * dt) * inertia
+	local p = p0 + v * dt
+
+	return p, v
+end
+
+return Spring
