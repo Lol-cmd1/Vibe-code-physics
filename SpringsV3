@@ -1,6 +1,4 @@
 --!strict
--- Spring module (API-compatible, names preserved)
--- tuned for soft-body / jiggle-style secondary motion
 
 local Spring = {}
 Spring.__index = Spring
@@ -38,8 +36,8 @@ function Spring.new<T>(initial: T?, clock: SpringClock?): Spring<T>
 		_position0 = p0,
 		_velocity0 = 0 * (p0 :: any),
 		_target = p0,
-		_damper = 0.14,
-		_speed = 0.75,
+		_damper = 0.12,
+		_speed = 4.2,
 	} :: any, Spring) :: Spring<T>
 end
 
@@ -125,47 +123,24 @@ function Spring._positionVelocity<T>(self: Spring<T>, now: number): (T, T)
 	local p0 = self._position0
 	local v0 = self._velocity0
 	local p1 = self._target
+
 	local d = self._damper
 	local s = self._speed
 
-	local dt = math.max(0, now - self._time0)
-	local t = s * dt
+	local dt = math.clamp(now - self._time0, 0, 1/30)
 
-	local decay = math.exp(-d * t)
+	local k = s * s
+	local c = 2 * d * s
 
-	local vMag = (typeof(v0) == "Vector3") and v0.Magnitude or math.abs(v0 :: any)
-	local inertia = 1 + math.clamp(vMag * 0.25, 0, 1.5)
+	local x = p0 - p1
+	local a = (-k * x) - (c * v0)
 
-	local wobbleFreq = 1.8
-	local wobbleAmp = math.clamp(vMag * 0.18, 0, 0.6)
+	local inertia = math.exp(-dt / 0.5)
 
-	local wobble = math.sin(t * wobbleFreq) * wobbleAmp
-	local lag = math.sin(t * 0.65) * wobbleAmp * 0.6
+	local v = (v0 + a * dt) * inertia
+	local p = p0 + v * dt
 
-	local gravityBias = 1
-	if typeof(v0) ~= "Vector3" then
-		if v0 > 0 then
-			gravityBias = 1.15
-		else
-			gravityBias = 0.9
-		end
-	end
-
-	local pos =
-		p1
-		+ (p0 - p1) * decay
-		+ (v0 * (t * inertia)) * decay
-		+ (p0 - p1) * wobble
-		+ v0 * lag
-
-	local air = 1 / (1 + vMag * 0.35)
-
-	local vel =
-		(v0 * air)
-		+ (p1 - p0) * (s * 0.45)
-		- v0 * d * gravityBias
-
-	return pos, vel
+	return p, v
 end
 
 return Spring
