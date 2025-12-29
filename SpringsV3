@@ -1,0 +1,171 @@
+--!strict
+-- Spring module (API-compatible, names preserved)
+-- tuned for soft-body / jiggle-style secondary motion
+
+local Spring = {}
+Spring.__index = Spring
+
+export type SpringClock = () -> number
+
+export type Spring<T> = typeof(setmetatable(
+	{} :: {
+		Position: T,
+		Value: T,
+		Velocity: T,
+		Target: T,
+		Damper: number,
+		Speed: number,
+		Clock: SpringClock,
+
+		_position0: T,
+		_velocity0: T,
+		_time0: number,
+		_target: T,
+		_damper: number,
+		_speed: number,
+		_clock: SpringClock,
+	},
+	{} :: typeof({ __index = Spring })
+))
+
+function Spring.new<T>(initial: T?, clock: SpringClock?): Spring<T>
+	local p0 = initial or 0
+	local springClock = clock or os.clock
+
+	return setmetatable({
+		_clock = springClock,
+		_time0 = springClock(),
+		_position0 = p0,
+		_velocity0 = 0 * (p0 :: any),
+		_target = p0,
+		_damper = 0.14,
+		_speed = 0.75,
+	} :: any, Spring) :: Spring<T>
+end
+
+function Spring.Impulse<T>(self: Spring<T>, velocity: T)
+	self.Velocity = (self.Velocity :: any) + velocity
+end
+
+function Spring.TimeSkip<T>(self: Spring<T>, delta: number)
+	local now = self._clock()
+	local position, velocity = self:_positionVelocity(now + delta)
+	self._position0 = position
+	self._velocity0 = velocity
+	self._time0 = now
+end
+
+function Spring.SetTarget<T>(self: Spring<T>, value: T, doNotAnimate: boolean?)
+	if doNotAnimate then
+		local now = self._clock()
+		self._position0 = value
+		self._velocity0 = 0 * (value :: any)
+		self._target = value
+		self._time0 = now
+	else
+		self.Target = value
+	end
+end
+
+(Spring :: any).__index = function<T>(self: Spring<T>, index: any): any
+	if Spring[index] then
+		return Spring[index]
+	elseif index == "Value" or index == "Position" or index == "p" then
+		local position = self:_positionVelocity(self._clock())
+		return position
+	elseif index == "Velocity" or index == "v" then
+		local _, velocity = self:_positionVelocity(self._clock())
+		return velocity
+	elseif index == "Target" or index == "t" then
+		return self._target
+	elseif index == "Damper" or index == "d" then
+		return self._damper
+	elseif index == "Speed" or index == "s" then
+		return self._speed
+	elseif index == "Clock" then
+		return self._clock
+	else
+		error(string.format("%q is not a valid member of Spring", tostring(index)), 2)
+	end
+end
+
+function Spring.__newindex<T>(self: Spring<T>, index, value)
+	local now = self._clock()
+	local p, v = self:_positionVelocity(now)
+
+	if index == "Value" or index == "Position" or index == "p" then
+		self._position0 = value
+		self._velocity0 = v
+	elseif index == "Velocity" or index == "v" then
+		self._position0 = p
+		self._velocity0 = value
+	elseif index == "Target" or index == "t" then
+		self._position0 = p
+		self._velocity0 = v
+		self._target = value
+	elseif index == "Damper" or index == "d" then
+		self._position0 = p
+		self._velocity0 = v
+		self._damper = value :: any
+	elseif index == "Speed" or index == "s" then
+		self._position0 = p
+		self._velocity0 = v
+		self._speed = math.max(0, value :: any)
+	elseif index == "Clock" then
+		self._position0 = p
+		self._velocity0 = v
+		self._clock = value :: any
+		self._time0 = (value :: any)()
+	end
+
+	self._time0 = now
+end
+
+function Spring._positionVelocity<T>(self: Spring<T>, now: number): (T, T)
+	local p0 = self._position0
+	local v0 = self._velocity0
+	local p1 = self._target
+	local d = self._damper
+	local s = self._speed
+
+	local dt = math.max(0, now - self._time0)
+	local t = s * dt
+
+	local decay = math.exp(-d * t)
+
+	local vMag = (typeof(v0) == "Vector3") and v0.Magnitude or math.abs(v0 :: any)
+	local inertia = 1 + math.clamp(vMag * 0.25, 0, 1.5)
+
+	local wobbleFreq = 1.8
+	local wobbleAmp = math.clamp(vMag * 0.18, 0, 0.6)
+
+	local wobble = math.sin(t * wobbleFreq) * wobbleAmp
+	local lag = math.sin(t * 0.65) * wobbleAmp * 0.6
+
+	local gravityBias = 1
+	if typeof(v0) ~= "Vector3" then
+		if v0 > 0 then
+			gravityBias = 1.15
+		else
+			gravityBias = 0.9
+		end
+	end
+
+	local pos =
+		p1
+		+ (p0 - p1) * decay
+		+ (v0 * (t * inertia)) * decay
+		+ (p0 - p1) * wobble
+		+ v0 * lag
+
+	local air = 1 / (1 + vMag * 0.35)
+
+	local vel =
+		(v0 * air)
+		+ (p1 - p0) * (s * 0.45)
+		- v0 * d * gravityBias
+
+	return pos, vel
+end
+
+return Spring
