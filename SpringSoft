@@ -9,7 +9,6 @@ export type SpringClock = () -> number
 function Spring.new<T>(initial: T?, clock: SpringClock?)
 	local p0 = initial or 0
 	local springClock = clock or os.clock
-
 	local seed = math.random()
 	local asym = (seed - 0.5) * 0.15
 
@@ -31,9 +30,9 @@ end
 
 function Spring.TimeSkip<T>(self, delta: number)
 	local now = self._clock()
-	local position, velocity = self:_positionVelocity(now + delta)
-	self._position0 = position
-	self._velocity0 = velocity
+	local p, v = self:_positionVelocity(now + delta)
+	self._position0 = p
+	self._velocity0 = v
 	self._time0 = now
 end
 
@@ -50,9 +49,8 @@ function Spring.SetTarget<T>(self, value: T, doNotAnimate: boolean?)
 end
 
 (Spring :: any).__index = function(self, index)
-	if Spring[index] then
-		return Spring[index]
-	elseif index == "Value" or index == "Position" or index == "p" then
+	if Spring[index] then return Spring[index] end
+	if index == "Value" or index == "Position" or index == "p" then
 		return self:_positionVelocity(self._clock())
 	elseif index == "Velocity" or index == "v" then
 		local _, v = self:_positionVelocity(self._clock())
@@ -65,9 +63,8 @@ end
 		return self._speed
 	elseif index == "Clock" then
 		return self._clock
-	else
-		error(string.format("%q is not a valid member of Spring", tostring(index)), 2)
 	end
+	error(string.format("%q is not a valid member of Spring", tostring(index)), 2)
 end
 
 function Spring.__newindex(self, index, value)
@@ -109,20 +106,16 @@ function Spring._positionVelocity(self, now)
 
 	local d = self._damper
 	local s = self._speed
-
 	local dt = math.clamp(now - self._time0, 0, 1/30)
 
 	local k = s * s
 	local c = 2 * d * s
-
 	local x = p0 - p1
 	local a = (-k * x) - (c * v0)
-
 	local inertia = math.exp(-dt / (0.55 + math.abs(self._asym)))
 
 	local v = (v0 + a * dt) * inertia
 	local p = p0 + v * dt
-
 	return p, v
 end
 
