@@ -118,7 +118,7 @@ function Spring._positionVelocity(self, now)
 	local x = p0 - p1
 	local a = (-k * x) - (c * v0)
 
-	local inertia = math.exp(-dt / (0.45 + math.abs(self._asym)))
+	local inertia = math.exp(-dt / (0.55 + math.abs(self._asym)))
 
 	local v = (v0 + a * dt) * inertia
 	local p = p0 + v * dt
