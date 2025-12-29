@@ -3684,28 +3684,25 @@ UIS.InputBegan:Connect(function(input, gameProcessed)
 end)
 
 local RunService = game:GetService("RunService")
-
-local SOFTBODY_ASSET_ID = "rbxassetid://7606070501"
-local Softbody = {}
-
 local Spring = require(script:WaitForChild("Spring"))
+
+local Softbody = {}
 
 local function attach(part)
 	if Softbody[part] then return end
 	if not part:IsA("MeshPart") then return end
-	if part.MeshId ~= SOFTBODY_ASSET_ID then return end
 
 	local sx = Spring.new(0)
 	local sy = Spring.new(0)
 	local sz = Spring.new(0)
 
-	sx.Speed *= 0.9
-	sy.Speed *= 0.6
-	sz.Speed *= 0.9
+	sx.Speed = sx.Speed * 0.9
+	sy.Speed = sy.Speed * 0.6
+	sz.Speed = sz.Speed * 0.9
 
-	sx.Damper *= 1.1
-	sy.Damper *= 1.4
-	sz.Damper *= 1.1
+	sx.Damper = sx.Damper * 1.1
+	sy.Damper = sy.Damper * 1.4
+	sz.Damper = sz.Damper * 1.1
 
 	Softbody[part] = {
 		x = sx,
@@ -3716,18 +3713,18 @@ local function attach(part)
 end
 
 for _, d in ipairs(workspace:GetDescendants()) do
-	if d:IsA("BasePart") then
+	if d:IsA("MeshPart") then
 		attach(d)
 	end
 end
 
 workspace.DescendantAdded:Connect(function(d)
-	if d:IsA("BasePart") then
+	if d:IsA("MeshPart") then
 		attach(d)
 	end
 end)
 
-RunService:BindToRenderStep("SoftbodyLate", Enum.RenderPriority.Last.Value, function()
+RunService:BindToRenderStep("SoftbodyDebugLate", Enum.RenderPriority.Last.Value, function()
 	for part, data in pairs(Softbody) do
 		if not part.Parent then
 			Softbody[part] = nil
@@ -3736,9 +3733,9 @@ RunService:BindToRenderStep("SoftbodyLate", Enum.RenderPriority.Last.Value, func
 			local impact = math.max(0, data.lastY - vel.Y)
 			data.lastY = vel.Y
 
-			data.x.Target = vel.X * 0.002
-			data.y.Target = vel.Y * 0.003 - impact * 0.005
-			data.z.Target = vel.Z * 0.002
+			data.x.Target = vel.X * 0.003
+			data.y.Target = vel.Y * 0.004 - impact * 0.006
+			data.z.Target = vel.Z * 0.003
 
 			local offset = Vector3.new(
 				data.x.Position,
