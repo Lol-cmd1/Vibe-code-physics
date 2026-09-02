@@ -107,8 +107,16 @@ function run(Player)
 			local c = 2 * d * s
 			local x = self.P[i] - self.T[i]
 			local a = -k * x - c * self.V[i]
+			
 			self.V[i] = self.V[i] + a * dt
 			self.P[i] = self.P[i] + self.V[i] * dt
+			
+			-- The NaN/Explosion Guard: Resets the spring if the physics break
+			if self.P[i] ~= self.P[i] or self.P[i] > 500 or self.P[i] < -500 then
+				self.P[i] = 0
+				self.V[i] = 0
+				self.T[i] = 0
+			end
 		end
 	end
 
@@ -2694,6 +2702,7 @@ function run(Player)
 		local r, g, b = str:match("([^,]+),([^,]+),([^,]+)")
 		return Color3.fromRGB(math.round(tonumber(r)), math.round(tonumber(g)), math.round(tonumber(b)))
 	end
+	
 	function Function.TabletoString(v, spacehierachys, usesemicolon, depth)
 		if type(v) ~= 'table' then
 			if type(v) == 'string' then
@@ -2722,6 +2731,7 @@ function run(Player)
 		local s = table.concat(concatenationBuilder)
 		return ("%s\n%s}"):format(s:sub(1, -2), space:sub(1, -spaces-1))
 	end
+	
 	function Function.StringtoTable(str)
 		local tbl = {}
 		for key, value in str:gmatch('%[\"(.-)\"%] = \"(.-)\"') do
@@ -2755,15 +2765,12 @@ function run(Player)
 		Decal.Name = "Areola Decal"
 		PlayerData[Data].CurrentPartList.AreolaDecal[Decal] = ObjectInstance
 
-
-
 		Decal.Color3 = Function.DarkenColor(Character.Torso.Color,0.32)
 	end
 
 	function Function.createSurfaceAppearance(ObjectInstance, Character, Extra, Data, Data2)
 		pcall(function()
 			if not RunService:IsStudio() then
-				-- Data2 logic adjustment incase it comes packaged as {{["ColorMap"] = ..., ["Color"] = ...}}
 				local config = (type(Data2[1]) == "table") and Data2[1] or Data2
 				local ColorMap, Color = config["ColorMap"], config["Color"]
 
@@ -3076,11 +3083,11 @@ function run(Player)
 					end
 				end
 
-
 				ObjectInstance.CanCollide = false
 				ObjectInstance.CanQuery = false
 				ObjectInstance.CanTouch = false
 				ObjectInstance.Massless = true
+				ObjectInstance.Anchored = false
 
 				ObjectInstance.Name = NAME
 				ObjectInstance.Transparency = TRANSPARENCY
@@ -3465,8 +3472,9 @@ function run(Player)
 			local Character = Players:FindFirstChild(PlayerName) and Players[PlayerName].Character
 			if not Character then continue end
 
-			local Base = Character:FindFirstChild("Torso") or Character.PrimaryPart
-			if not Base then continue end
+			-- Track the HumanoidRootPart to stop walking animation amplification wobble!
+			local Root = Character:FindFirstChild("HumanoidRootPart") or Character.PrimaryPart
+			if not Root then continue end
 
 			local PList = DataList.CurrentPartList.BodyPartPhysics
 			if not next(PList) then continue end
@@ -3476,27 +3484,24 @@ function run(Player)
 				TState = {}
 				DataList.TorsoState = TState
 			end
-
-			local CF = Base.CFrame
-			local LastCF = TState.LastCF or CF
-
-			local vel = (CF.Position - LastCF.Position) / dt
+			
+			-- Use Roblox's built-in engine momentum instead of frame-by-frame CFrame math
+			local vel = Root.AssemblyLinearVelocity
+			local angVel = Root.AssemblyAngularVelocity
+			
+			-- Smooth the velocity out slightly
 			vel = TState.Vel and TState.Vel:Lerp(vel, 0.45) or vel
-
-			local axis, ang = (LastCF.Rotation:Inverse() * CF.Rotation):ToAxisAngle()
-			local angVel = axis * (ang / dt)
 			angVel = TState.AngVel and TState.AngVel:Lerp(angVel, 0.45) or angVel
 
 			local accel = (vel - (TState.LastVel or vel)) / dt
 			accel = TState.Accel and TState.Accel:Lerp(accel, 0.5) or accel
 
-			TState.LastCF = CF
 			TState.LastVel = vel
 			TState.Vel = vel
 			TState.AngVel = angVel
 			TState.Accel = accel
 
-			local invRot = CF.Rotation:Inverse()
+			local invRot = Root.CFrame.Rotation:Inverse()
 			local accelLocal = ClampVector(invRot * accel, 35)
 			local angVelLocal = ClampVector(invRot * angVel, 6)
 
@@ -3529,14 +3534,8 @@ function run(Player)
 					PList[Part] = nil
 					continue
 				end
-
+				
 				local Cfg = Prop.Config
-
-				if (Part.Position - Base.Position).Magnitude > 15 then
-					Prop.Pos:Reset()
-					Prop.Rot:Reset()
-					if Prop.Jig then Prop.Jig:Reset() end
-				end
 
 				Prop.Pos:TimeSkip(dt)
 				Prop.Rot:TimeSkip(dt)
@@ -3564,22 +3563,20 @@ function run(Player)
 				local ownVel = Prop.Pos:GetVelocity()
 				local partnerVel = Ptn.Pos:GetVelocity()
 
-				local feed = Cfg.Coupling * n
-				Prop.Pos:Impulse(partnerVel * feed)
-				Ptn.Pos:Impulse(ownVel * feed)
-
-				local sync = (partnerVel - ownVel) * (Cfg.Sync * n)
-				Prop.Pos:Impulse(sync)
-				Ptn.Pos:Impulse(-sync)
+				local syncStrength = math.clamp(Cfg.Sync * n, 0, 1)
+				local avgVel = (ownVel + partnerVel) * 0.5
+				Prop.Pos:Impulse((avgVel - ownVel) * syncStrength)
+				Ptn.Pos:Impulse((avgVel - partnerVel) * syncStrength)
 
 				local baseCF = Prop.Base.CFrame
 				local aLocal = baseCF:PointToObjectSpace(Part.Position)
 				local bLocal = baseCF:PointToObjectSpace(Ptn.Part.Position)
 				local sep = math.abs(aLocal.X - bLocal.X)
 				local thresh = (Prop.RestSep or 0.4) * Cfg.RestGapFactor
+				
 				if Cfg.RestGapFactor > 0 and sep < thresh then
 					local dir = aLocal.X >= bLocal.X and 1 or -1
-					local push = (thresh - sep) * Cfg.Repulse * n
+					local push = math.clamp((thresh - sep) * Cfg.Repulse * n, 0, 5)
 					Prop.Pos:Impulse(Vector3.new(dir * push, 0, 0))
 					Ptn.Pos:Impulse(Vector3.new(-dir * push, 0, 0))
 				end
@@ -3757,4 +3754,3 @@ UIS.InputBegan:Connect(function(input, gameProcessed)
         toggleCharacterModel(targets)
     end
 end)
-
