@@ -1,47 +1,13 @@
-
-local PartCreator = {}
+Local PartCreator = {}
 
 local Function = {}
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 
-
 function run(Player)
 	local Camera = workspace.CurrentCamera
-
 	local IS = game:GetService("InsertService")
-
-	local Spring
-
-
-
-	if RunService:IsStudio() then
-		Spring = require(script.Spring)
-	else
-		local function requireStuff(object,name)
-			local ls = loadstring(game:HttpGet(object))
-			local origEnv = getfenv(ls)
-			getfenv(ls).script = name
-			getfenv(ls).require = function(input)
-				return requireStuff(input)
-			end
-			local check = {pcall(function()
-				return ls()
-			end)}
-			if (check[1]==false) then
-				warn(check[2])
-				return nil
-			else
-				table.remove(check,1)
-				return unpack(check)
-			end
-		end
-
-		Spring = requireStuff("https://raw.githubusercontent.com/Lol-cmd1/Vibe-code-physics/refs/heads/main/SpringsDetails","Spring")
-	end
-
-
 	local SelectPlayer = Player.Name
 
 	-- ============================================================
@@ -49,44 +15,25 @@ function run(Player)
 	-- ============================================================
 	local PhysicsConfig = {
 		Breast = {
-			-- spring frequency / damping per axis: X, Y, Z
-			-- Speed  = stiffness (bigger = snaps back faster)
-			-- Damper = resistance (1 = critically damped, <1 = jiggly)
 			Speed  = { 9.0, 10.0, 8.5 },
 			Damper = { 0.55, 0.60, 0.50 },
-
-			-- rotation springs (spin feel)
 			RotSpeed  = { 7.0, 7.0, 7.0 },
 			RotDamper = { 0.60, 0.60, 0.60 },
-
-			-- drive strength
-			Kick    = 2.2,   -- torso acceleration -> jiggle impulse
-			RotKick = 1.8,   -- torso spin -> rotation impulse
-			Drag    = 0.05,  -- velocity -> spring target (the "lag / lean into motion" feel)
+			Kick    = 0.30,   -- torso accel -> jiggle impulse
+			RotKick = 0.15,   -- torso spin  -> rotation impulse
+			Drag    = 0.05,   -- velocity -> spring target (lag/lean)
 			RotDrag = 0.0005,
-
-			-- extra fast micro-jiggle (landings, walk bob)
-			Jiggle = 0.35, JigSpeed = 16, JigDamper = 0.4,
-
-			-- output gains (per axis feel)
+			Jiggle = 0.12, JigSpeed = 16, JigDamper = 0.4,
 			AxisGain    = Vector3.new(1.0, 1.15, 0.9),
 			RotAxisGain = Vector3.new(1.0, 0.75, 0.9),
-
-			-- REACTION TO EACH OTHER
-			Coupling = 0.25,  -- % of partner's motion fed into this one
-			Sync     = 0.10,  -- tames opposite-phase wobble (settle together)
-			RestGapX = 0.50,  -- rest separation between the two (squeeze threshold)
-			Repulse  = 0.80,  -- push-back strength when squeezed past RestGapX
-
-			-- softbody feel
-			Squash = 0.20,    -- squash & stretch amount
-
-			-- safety
-			MaxOffset   = 1.30, -- studs
-			MaxRotation = 0.55, -- radians
-
-			-- left/right asymmetry so they never move identically
-			Variance = 0.06,
+			Coupling = 0.25,      -- % of partner motion fed into this one
+			Sync     = 0.10,      -- anti-phase tamer
+			RestGapFactor = 0.85, -- squeeze triggers when sep < 85% of rest gap
+			Repulse  = 0.80,      -- push-back strength
+			Squash   = 0.20,      -- squash & stretch
+			MaxOffset   = 1.30,
+			MaxRotation = 0.55,
+			Variance = 0.06,      -- L/R stiffness asymmetry
 		},
 
 		Butt = {
@@ -94,73 +41,82 @@ function run(Player)
 			Damper = { 0.45, 0.50, 0.40 },
 			RotSpeed  = { 5.0, 5.0, 5.0 },
 			RotDamper = { 0.50, 0.50, 0.50 },
-			Kick = 1.4, RotKick = 1.1,
+			Kick = 0.25, RotKick = 0.12,
 			Drag = 0.03, RotDrag = 0.0005,
-			Jiggle = 0.25, JigSpeed = 12, JigDamper = 0.45,
+			Jiggle = 0.08, JigSpeed = 12, JigDamper = 0.45,
 			AxisGain    = Vector3.new(1, 1, 1),
 			RotAxisGain = Vector3.new(1, 1, 1),
-			Coupling = 0.20,  -- cheek-to-cheek reaction
+			Coupling = 0.20,
 			Sync     = 0.08,
-			RestGapX = 0.85,  -- rest separation between butt cheeks
+			RestGapFactor = 0.80,
 			Repulse  = 0.70,
-			Squash  = 0.10,
+			Squash   = 0.10,
 			MaxOffset   = 1.00,
 			MaxRotation = 0.40,
 			Variance = 0.04,
 		},
 
-		UV = { -- UV-mode breast root (milder on purpose)
+		UV = {
 			Speed  = { 6.0, 6.0, 6.0 },
 			Damper = { 0.60, 0.60, 0.60 },
 			RotSpeed  = { 5.0, 5.0, 5.0 },
 			RotDamper = { 0.70, 0.70, 0.70 },
-			Kick = 1.2, RotKick = 1.0,
+			Kick = 0.20, RotKick = 0.10,
 			Drag = 0.03, RotDrag = 0.0005,
-			Jiggle = 0.20, JigSpeed = 10, JigDamper = 0.5,
+			Jiggle = 0.06, JigSpeed = 10, JigDamper = 0.5,
 			AxisGain    = Vector3.new(1, 1, 1),
 			RotAxisGain = Vector3.new(1, 1, 1),
-			Coupling = 0, Sync = 0, RestGapX = 0, Repulse = 0,
-			Squash  = 0.08,
+			Coupling = 0, Sync = 0, RestGapFactor = 0, Repulse = 0,
+			Squash   = 0.08,
 			MaxOffset   = 0.80,
 			MaxRotation = 0.30,
 			Variance = 0,
 		},
 	}
 
-	-- a set of 3 independent scalar springs (one per axis)
+	-- ============================================================
+	--  SELF-CONTAINED SPRING SET (no external module dependency)
+	--  3 independent damped springs, one per axis.
+	--  Semi-implicit Euler integrator: stable, cheap, deterministic.
+	-- ============================================================
 	local SpringSet = {}
 	SpringSet.__index = SpringSet
 
 	function SpringSet.new(speed, damper)
-		local self = setmetatable({}, SpringSet)
-		self.Axes = {}
-		for i = 1, 3 do
-			local s = Spring.new(0)
-			s.Target = 0
-			s.Speed = speed[i]
-			s.Damper = damper[i]
-			self.Axes[i] = s
-		end
-		return self
+		return setmetatable({
+			P = { 0, 0, 0 }, -- position per axis
+			V = { 0, 0, 0 }, -- velocity per axis
+			T = { 0, 0, 0 }, -- target per axis
+			Speed  = { speed[1], speed[2], speed[3] },
+			Damper = { damper[1], damper[2], damper[3] },
+		}, SpringSet)
 	end
 
 	function SpringSet:Reset()
 		for i = 1, 3 do
-			local s = self.Axes[i]
-			s.Position = 0
-			s.Velocity = 0
-			s.Target = 0
+			self.P[i] = 0
+			self.V[i] = 0
+			self.T[i] = 0
 		end
 	end
 
 	function SpringSet:TimeSkip(dt)
-		for i = 1, 3 do self.Axes[i]:TimeSkip(dt) end
+		for i = 1, 3 do
+			local s = self.Speed[i]
+			local d = self.Damper[i]
+			local k = s * s
+			local c = 2 * d * s
+			local x = self.P[i] - self.T[i]
+			local a = -k * x - c * self.V[i]
+			self.V[i] = self.V[i] + a * dt
+			self.P[i] = self.P[i] + self.V[i] * dt
+		end
 	end
 
 	function SpringSet:Impulse(v)
 		for i = 1, 3 do
 			local vi = v[i]
-			if vi ~= 0 then self.Axes[i]:Impulse(vi) end
+			if vi ~= 0 then self.V[i] = self.V[i] + vi end
 		end
 	end
 
@@ -168,21 +124,23 @@ function run(Player)
 		for From, To in pairs(mapping) do
 			local ax = From == "X" and 1 or From == "Y" and 2 or 3
 			local src = To == "X" and 1 or To == "Y" and 2 or 3
-			local v = source[src]
-			if v ~= 0 then self.Axes[ax]:Impulse(v) end
+			local val = source[src]
+			if val ~= 0 then self.V[ax] = self.V[ax] + val end
 		end
 	end
 
 	function SpringSet:SetTargets(v)
-		for i = 1, 3 do self.Axes[i].Target = v and v[i] or 0 end
+		for i = 1, 3 do
+			self.T[i] = v and v[i] or 0
+		end
 	end
 
 	function SpringSet:Get()
-		return Vector3.new(self.Axes[1].Position, self.Axes[2].Position, self.Axes[3].Position)
+		return Vector3.new(self.P[1], self.P[2], self.P[3])
 	end
 
 	function SpringSet:GetVelocity()
-		return Vector3.new(self.Axes[1].Velocity, self.Axes[2].Velocity, self.Axes[3].Velocity)
+		return Vector3.new(self.V[1], self.V[2], self.V[3])
 	end
 
 	-- moves a vector through an axis remap like {X="Y",Y="Z",Z="X"}
@@ -3559,6 +3517,13 @@ function run(Player)
 					if sides.Left and sides.Right then
 						sides.Left.Partner = sides.Right
 						sides.Right.Partner = sides.Left
+						-- measure their actual rest separation
+						local baseCF = sides.Left.Base.CFrame
+						local aX = baseCF:PointToObjectSpace(sides.Left.Part.Position).X
+						local bX = baseCF:PointToObjectSpace(sides.Right.Part.Position).X
+						local rest = math.max(0.05, math.abs(aX - bX))
+						sides.Left.RestSep = rest
+						sides.Right.RestSep = rest
 					end
 				end
 				TState.Paired = true
@@ -3628,9 +3593,10 @@ function run(Player)
 				local aLocal = baseCF:PointToObjectSpace(Part.Position)
 				local bLocal = baseCF:PointToObjectSpace(Ptn.Part.Position)
 				local sep = math.abs(aLocal.X - bLocal.X)
-				if Cfg.RestGapX > 0 and sep < Cfg.RestGapX then
+				local thresh = (Prop.RestSep or 0.4) * Cfg.RestGapFactor
+				if Cfg.RestGapFactor > 0 and sep < thresh then
 					local dir = aLocal.X >= bLocal.X and 1 or -1
-					local push = (Cfg.RestGapX - sep) * Cfg.Repulse * n
+					local push = (thresh - sep) * Cfg.Repulse * n
 					Prop.Pos:Impulse(Vector3.new(dir * push, 0, 0))
 					Ptn.Pos:Impulse(Vector3.new(-dir * push, 0, 0))
 				end
