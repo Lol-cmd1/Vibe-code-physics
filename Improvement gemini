@@ -16,7 +16,7 @@ function run(Player)
 	-- ============================================================
 	local PhysicsConfig = {
 		Breast = {
-			Speed  = { 9.0, 10.0, 8.5 },
+			Speed  = { 4.5, 5.0, 4.25 },
 			Damper = { 0.55, 0.60, 0.50 },
 			RotSpeed  = { 7.0, 7.0, 7.0 },
 			RotDamper = { 0.60, 0.60, 0.60 },
@@ -25,7 +25,7 @@ function run(Player)
 			Drag    = 0.05,   
 			RotDrag = 0.0005,
 			Jiggle = 0.12, JigSpeed = 16, JigDamper = 0.4,
-			AxisGain    = Vector3.new(1.0, 1.15, 0.9),
+			AxisGain    = Vector3.new(1.0, 1.0, 1.0),
 			RotAxisGain = Vector3.new(1.0, 0.75, 0.9),
 			Coupling = 0.25,      
 			Sync     = 0.10,      
