@@ -1,0 +1,1932 @@
+
+--[[===========================================================================
+	█▀▄▀█ █▄█ █▀█ ▄▄ █▀█ ▄▀█ █ █▀█ ▄▄ ▄▀█ ▀█▀ █▀
+	█░▀░█ ░█░ █▄█ ░░ █▀▄ █▀█ █ █▀▄ ░░ █▀█ ░█░ ▄█
+	ULTIMATE MORPH ENGINE v2.0  —  fully self-contained executor script
+	Spring physics • secondary motion • squash/stretch • faces • footsteps
+	GUI selector • chat commands • glitch FX • quality scaling • zero HTTP
+===========================================================================]]--
+
+--#region ██ CONFIG ██
+local CONFIG = {
+	PhysicsMultiply   = {Position = 7.5, Rotation = 2},
+	MaxViewDistance   = 300,          -- studs: full-physics radius
+	CullGraceTime     = 0.25,         -- sec frozen before fast-forward kicks in
+	SpringSubstep     = 1/120,        -- physics integration substep
+	MaxFrameDelta     = 0.1,          -- anti spiral-of-death clamp
+	Squash            = {Speed = 10, Damper = 0.32, JumpKick = 0.9, LandKick = 1.6, Gain = 0.10},
+	IdleBobDefault    = {Amp = 0.035, Speed = 1.6},
+	WindNoise         = 0.06,         -- ambient micromovement strength
+	TrailThreshold    = 14,           -- spring speed before particle trail
+	FootstepStride    = 3.4,          -- studs per footstep
+	GlitchDuration    = 0.42,
+	AutoApply         = true,         -- re-morph automatically on respawn
+	DebugPrint        = false,
+	QualityAutoFPS    = {Low = 25, Medium = 45},
+	MorphCycleOrder   = {"ClemonFemale","RoClothes1","ClemonMale","Robot","Ghost","Slime","Snowman"},
+	ColorPresets = {
+		{name="Original", c=nil},
+		{name="Crimson",  c=Color3.fromRGB(205, 35, 45)},
+		{name="Mint",     c=Color3.fromRGB(85, 235, 155)},
+		{name="Gold",     c=Color3.fromRGB(255, 200, 60)},
+		{name="Void",     c=Color3.fromRGB(45, 38, 62)},
+		{name="Frost",    c=Color3.fromRGB(185, 228, 255)},
+	},
+}
+--#endregion
+
+--#region ██ SERVICES / ENV ██
+local _g = (typeof(getgenv) == "function" and getgenv()) or {}
+-- Re-execution guard: tear down a previous instance cleanly
+if _g.__MorphEngineUnload then pcall(_g.__MorphEngineUnload) end
+
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService     = game:GetService("TweenService")
+local Debris           = game:GetService("Debris")
+local InsertService    = game:GetService("InsertService")
+local TextChatService  = game:GetService("TextChatService")
+local SoundService     = game:GetService("SoundService")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera      = workspace.CurrentCamera
+local IsStudio    = RunService:IsStudio()
+local Clock       = os.clock
+
+local function dprint(...) if CONFIG.DebugPrint then print("[Morph]", ...) end end
+local function warnf(...) warn("[Morph]", ...) end
+--#endregion
+
+--#region ██ SPRING MODULE (damped harmonic oscillator, per-axis tunable) ██
+-- Semi-implicit Euler integration:  a = -ω²·(x-target) - c·v + Fext
+-- c = Damper·2ω  →  Damper≈1 is critically damped, <1 bounces, >1 sludges.
+-- AirDrag bleeds velocity exponentially (natural inertia/lag). ExtForce lets
+-- the engine inject wind noise, gravity sag and chain coupling cleanly.
+local Spring = {}
+Spring.__index = Spring
+
+function Spring.new(position)
+	return setmetatable({
+		Position     = position or Vector3.zero,
+		Velocity     = Vector3.zero,
+		Target       = position or Vector3.zero,
+		Speed        = 10,       -- ω (rad/s): higher = snappier
+		Damper       = 0.25,     -- ζ-ish: lower = jigglier
+		AirDrag      = 0.6,      -- 1/s velocity bleed (air resistance)
+		MaxDisplace  = 8,        -- safety clamp
+		ExtForce     = Vector3.zero,
+		AxisTune     = nil,      -- optional {[\"X\"]={Speed=,Damper=,Drag=}, ...}
+	end, Spring)
+end
+
+function Spring:SetTarget(t) self.Target = t end
+function Spring:Impulse(f)   self.Velocity += f end
+function Spring:AddForce(f)  self.ExtForce  += f end
+function Spring:ConfigureAxis(t) self.AxisTune = t end
+
+function Spring:Step(dt)
+	local tune = self.AxisTune
+	local p, v, tg = self.Position, self.Velocity, self.Target
+	for _, ax in ipairs({"X","Y","Z"}) do
+		local w, dmp, drag = self.Speed, self.Damper, self.AirDrag
+		if tune then
+			local t2 = tune[ax]
+			if t2 then
+				w   = t2.Speed  or w
+				dmp = t2.Damper or dmp
+				drag= t2.Drag   or drag
+			end
+		end
+		local x  = p[ax] - tg[ax]
+		local a  = -(w*w)*x - (dmp*2*w)*v[ax] + self.ExtForce[ax]
+		local nv = (v[ax] + a*dt) * math.exp(-drag*dt)
+		v = Vector3.new(
+			ax=="X" and nv or v.X,
+			ax=="Y" and nv or v.Y,
+			ax=="Z" and nv or v.Z)
+	end
+	self.ExtForce = Vector3.zero
+	p += v*dt
+	if p.Magnitude > self.MaxDisplace then p = p.Unit * self.MaxDisplace end
+	-- settle kill (stops micro-jitter / saves CPU)
+	if v.Magnitude < 1e-3 and (p-tg).Magnitude < 1e-4 then v = Vector3.zero; p = tg end
+	self.Position, self.Velocity = p, v
+end
+
+-- Fast-forward simulation after a pause/cull; stable fixed substepping.
+function Spring:TimeSkip(duration)
+	local steps = math.clamp(math.ceil(duration / CONFIG.SpringSubstep), 1, 240)
+	local h = duration / steps
+	for _ = 1, steps do self:Step(h) end
+end
+--#endregion
+
+--#region ██ DATA / STATE HELPERS ██
+local PlayerData = {}
+
+local Method2BodyPart = {"Torso","Left Arm","Right Arm","Left Leg","Right Leg","Head"}
+
+local R6Map = {
+	["Head"]      = {Size=Vector3.new(2,1,1), Offset=CFrame.new(0,1.5,0)},
+	["Torso"]     = {Size=Vector3.new(2,2,1), Offset=CFrame.new()},
+	["Right Arm"] = {Size=Vector3.new(1,2,1), Offset=CFrame.new(1.5,0,0)},
+	["Left Arm"]  = {Size=Vector3.new(1,2,1), Offset=CFrame.new(-1.5,0,0)},
+	["Right Leg"] = {Size=Vector3.new(1,2,1), Offset=CFrame.new(0.5,-2,0)},
+	["Left Leg"]  = {Size=Vector3.new(1,2,1), Offset=CFrame.new(-0.5,-2,0)},
+}
+
+local R6Joints = {
+	["RootJoint"]={C0=CFrame.new()*CFrame.fromEulerAnglesXYZ(math.rad(-90),math.rad(180),0),C1=CFrame.new()*CFrame.fromEulerAnglesXYZ(math.rad(-90),math.rad(180),0),Part0="HumanoidRootPart",Part1="Torso"},
+	["Left Hip"]={C0=CFrame.new(-1,-1,0)*CFrame.fromEulerAnglesXYZ(0,math.rad(-90),0),C1=CFrame.new(-0.5,1,0)*CFrame.fromEulerAnglesXYZ(0,math.rad(-90),0),Part0="Torso",Part1="Left Leg"},
+	["Left Shoulder"]={C0=CFrame.new(-1,0.5,0)*CFrame.fromEulerAnglesXYZ(0,math.rad(-90),0),C1=CFrame.new(0.5,0.5,0)*CFrame.fromEulerAnglesXYZ(0,math.rad(-90),0),Part0="Torso",Part1="Left Arm"},
+	["Right Hip"]={C0=CFrame.new(1,-1,0)*CFrame.fromEulerAnglesXYZ(0,math.rad(90),0),C1=CFrame.new(0.5,1,0)*CFrame.fromEulerAnglesXYZ(0,math.rad(90),0),Part0="Torso",Part1="Right Leg"},
+	["Right Shoulder"]={C0=CFrame.new(1,0.5,0)*CFrame.fromEulerAnglesXYZ(0,math.rad(90),0),C1=CFrame.new(-0.5,0.5,0)*CFrame.fromEulerAnglesXYZ(0,math.rad(90),0),Part0="Torso",Part1="Right Arm"},
+	["Neck"]={C0=CFrame.new(0,1,0)*CFrame.fromEulerAnglesXYZ(math.rad(-90),math.rad(180),0),C1=CFrame.new(0,-0.5,0)*CFrame.fromEulerAnglesXYZ(math.rad(-90),math.rad(180),0),Part0="Torso",Part1="Head"},
+}
+
+local R6_2_R15 = {
+	["Torso"]={C0=CFrame.new(0,-0.2,0),Part0="UpperTorso",Part1="Torso"},
+	["Left Leg"]={C0=CFrame.new(0,0.201,0),Part0="LeftLowerLeg",Part1="Left Leg"},
+	["Left Arm"]={C0=CFrame.new(0,0.224,0),Part0="LeftLowerArm",Part1="Left Arm"},
+	["Right Leg"]={C0=CFrame.new(0,0.201,0),Part0="RightLowerLeg",Part1="Right Leg"},
+	["Right Arm"]={C0=CFrame.new(0,0.224,0),Part0="RightLowerArm",Part1="Right Arm"},
+}
+
+local BodyPartSize = {
+	["Head"]=Vector3.new(2,1,1), ["Torso"]=Vector3.new(2,2,1),
+	["Left Arm"]=Vector3.new(1,2,1), ["Right Arm"]=Vector3.new(1,2,1),
+	["Left Leg"]=Vector3.new(1,2,1), ["Right Leg"]=Vector3.new(1,2,1),
+	["HumanoidRootPart"]=Vector3.new(2,2,1),
+}
+
+-- small builders to keep morph data readable (values identical to original)
+local function V3(x,y,z) return {x=x,y=y,z=z} end
+local function J(part0, r0, p0, r1, p1)
+	r1, p1 = r1 or {0,-0,0}, p1 or {0,0,0}
+	return {Part0=part0,
+		CFrame ={Rotation=V3(r0[1],r0[2],r0[3]),Position=V3(p0[1],p0[2],p0[3])},
+		CFrame1={Rotation=V3(r1[1],r1[2],r1[3]),Position=V3(p1[1],p1[2],p1[3])}}
+end
+local function IDJ(part0) return J(part0,{0,-0,0},{0,0,0}) end
+local function MP(name, meshId, parent, joint, size, o)
+	o = o or {}
+	return {Instance="Mesh", MeshId=meshId, Name=name, Parent=parent, Joint=joint,
+		Size=size, Transparency=o.T or 0, Material=o.M or Enum.Material.SmoothPlastic,
+		Color=o.C or "Base", Function=o.F or {}, AdjustScale=o.AS, Physics=o.Ph,
+		Extra=o.Ex, UV=o.UV, RGB=o.RGB, SizeMult=o.SM, Chain=o.Chain,
+		ScaleKey=o.SK, IdleBob=o.IB}
+end
+local function PT(name, parent, joint, size, o)
+	o = o or {}
+	local t = {Instance="Part", Name=name, Parent=parent, Joint=joint, Size=size,
+		Transparency=o.T or 0, Material=o.M or Enum.Material.SmoothPlastic,
+		Shape=o.Shape or Enum.PartType.Block, Color=o.C or "Base",
+		Function=o.F or {}, Extra=o.Ex, AdjustScale=o.AS, Physics=o.Ph,
+		RGB=o.RGB, SizeMult=o.SM, Chain=o.Chain, ScaleKey=o.SK, IdleBob=o.IB, UV=o.UV}
+	if o.Mesh then
+		t.Mesh = {Scale=o.Mesh.Scale, MeshId=o.Mesh.Id or "",
+			MeshType=o.Mesh.Type or Enum.MeshType.Sphere, TextureId=o.Mesh.Tex or ""}
+	end
+	return t
+end
+--#endregion
+
+--#region ██ PART CONFIGURATION ██
+local function BuildPartLists()
+	----------------------------------------------------------------
+	-- CLEMON FEMALE
+	----------------------------------------------------------------
+	local ClemonFemale = {
+		NoUV = false,
+		Limbs = {
+			["Left Leg"]  = MP("Left Leg","rbxassetid://6870651596",{"Left Leg"},
+				J("Left Leg",{0,90.00000933466734,0},{-0.03792572021484375,0.12550246715545654,0.01025390625}),
+				V3(1.087515950202942,2.292320728302002,1.2521870136260986)),
+			["Right Leg"] = MP("Right Leg","rbxassetid://6870651384",{"Right Leg"},
+				J("Right Leg",{0,90.00000933466734,0},{0.048073768615722656,0.12545979022979736,0.0102691650390625}),
+				V3(1.0879312753677368,2.292334794998169,1.207716941833496)),
+			["Left Leg UV"] = MP("Left Leg UV","rbxassetid://6870651596",{"Left Leg","Left Leg"},IDJ("Left Leg"),
+				V3(1.087515950202942,2.292320728302002,1.2521870136260986),{T=1}),
+			["Right Leg UV"] = MP("Right Leg UV","rbxassetid://6870651384",{"Right Leg","Right Leg"},IDJ("Right Leg"),
+				V3(1.0879312753677368,2.292334794998169,1.207716941833496),{T=1}),
+			["TorsoMesh"] = MP("TorsoMesh","rbxassetid://13755434958",{"Torso"},
+				J("Torso",{-6.362426808311495e-10,179.999991348578,-0.00009387990064223813},{0,0.05200004577636719,0}),
+				V3(2.077857255935669,1.998084545135498,0.966502845287323),{T=1}),
+		},
+		Tacos = {{
+			["[A] Taco"] = PT("[A] Taco",{"TacoShell"},
+				J("TacoShell",{-64.00065520239285,0.00010906826101211563,179.99988206555128},{-0.0013651847839355469,-1.1307519674301147,-0.07950592041015625}),
+				V3(0.4109848141670227,0.6525917053222656,0.452888548374176),
+				{C=0.9973507482925269, Mesh={Scale=V3(0.20000000298023224,1.0099999904632568,1.0099999904632568)}}),
+			["[Skin] Lettuce R"] = PT("[Skin] Lettuce R",{"TacoShell"},
+				J("TacoShell",{-59.41658740131713,-10.699208735748066,-171.21645003821163},{0.10254335403442383,-1.100150465965271,-0.05848121643066406}),
+				V3(0.7523967027664185,0.7530205249786377,0.5753535628318787),
+				{Mesh={Scale=V3(0.6000000238418579,1,1)}}),
+			["[Skin] Lettuce A.1"] = PT("[Skin] Lettuce A.1",{"TacoShell"},
+				J("TacoShell",{-84.17179525551711,68.46451850426551,112.09061012948361},{0.011543750762939453,-1.2834436893463135,0.3380546569824219}),
+				V3(0.08978316932916641,0.15872108936309814,0.24876534938812256),
+				{C=0.9973507482925269, Mesh={Scale=V3(0.6000000238418579,1,1)}}),
+			["[B] Salsa.1"] = PT("[B] Salsa.1",{"TacoShell"},
+				J("TacoShell",{-64.00079863636542,0.0002534274959200993,179.99974546176787},{-0.0013651847839355469,-1.130752444267273,-0.07950592041015625}),
+				V3(0.4109848141670227,0.6525917053222656,0.452888548374176),
+				{C=0.9973507482925269, Mesh={Scale=V3(0.3559962213039398,1,1)}}),
+			["[B] Bean"] = PT("[B] Bean",{"TacoShell"},
+				J("TacoShell",{-50.2111179851624,-0.00068733999966085,-179.99933565041766},{-0.0013995170593261719,-0.9790191650390625,-0.34190940856933594}),
+				V3(0.4109853506088257,0.4109853506088257,0.4109854996204376),
+				{C=0.9973507482925269, Mesh={Scale=V3(0.0699358657002449,0.10383700579404831,0.5085670948028564)}}),
+			["[B] Bean.1"] = PT("[B] Bean.1",{"TacoShell"},
+				J("TacoShell",{-55.21145166520455,-0.0007886732493942861,-179.99925368814763},{-0.0013995170593261719,-0.9779143333435059,-0.3583049774169922}),
+				V3(0.4109853506088257,0.4109853506088257,0.4109854996204376),
+				{C=0.9973507482925269, Mesh={Scale=V3(0.18858975172042847,0.1970651000738144,0.36024942994117737)}}),
+			["[Skin] Lettuce L"] = PT("[Skin] Lettuce L",{"TacoShell"},
+				J("TacoShell",{-59.415979514481,10.699028589508705,171.21528890605273},{-0.1044764518737793,-1.1000949144363403,-0.05852699279785156}),
+				V3(0.7523967027664185,0.7530205249786377,0.5753535628318787),
+				{Mesh={Scale=V3(0.6000000238418579,1,1)}}),
+			["[B] Salsa"] = PT("[B] Salsa",{"TacoShell"},
+				J("TacoShell",{-33.99818183908725,0.00010423260307706939,179.99986840517292},{-0.0013728141784667969,-1.104068398475647,-0.2517814636230469}),
+				V3(0.4109853506088257,0.4109853506088257,0.4109854996204376),
+				{C=0.9973507482925269, Mesh={Scale=V3(0.26065924763679504,0.8546401262283325,0.5411533117294312)}}),
+			["[Skin] Lettuce A"] = PT("[Skin] Lettuce A",{"TacoShell"},
+				J("TacoShell",{-59.41596585410266,10.699040542339754,171.21528890605273},{0.014851093292236328,-1.1533641815185547,0.3640022277832031}),
+				V3(0.5523967146873474,0.33889174461364746,0.5363864898681641),
+				{Mesh={Scale=V3(0.6000000238418579,1,1)}}),
+		}},
+		Muffins = {
+			["MuffinsRoot"] = PT("MuffinsRoot",{"Torso"},
+				J("Torso",{-0.0000034158497759099423,-0.00001366099063496834,0.00003756666575756494},
+					{0.000015735626220703125,0.9002821445465088,-0.30001163482666016},
+					{-0.00016904969627534681,-3.2406041899604844e-08,-1.2819104782560808e-08},
+					{4.76837158203125e-07,-0.016043663024902344,-9.5367431640625e-07}),
+				V3(1.8799303770065308,0.09399651736021042,0.09399651736021042),
+				{T=1,M=Enum.Material.Plastic,F={"MuffinUVPhysics"}}),
+			["MuffinTexture"] = MP("MuffinTexture","rbxassetid://7606070501",{"Torso","MuffinsRoot"},
+				J("MuffinsRoot",{0.0011227206824541102,-90.0000639761807,21.762826846736527},
+					{0.00037335921660996974,0.03281303122639656,-0.00032988280872814357},
+					{-3.819331177023661e-07,-0.000002610753984724961,0.014690102728577648},
+					{0.4276745915412903,0.4371170103549957,0.009399866685271263}),
+				V3(1.3984088897705078,1.1277912855148315,1.6919373273849487),
+				{T=1,M=Enum.Material.Plastic}),
+			["MuffinPantsUV"] = MP("MuffinPantsUV","rbxassetid://7606070501",{"Torso","MuffinsRoot","MuffinTexture"},
+				IDJ("MuffinTexture"),V3(1.3984088897705078,1.1277912855148315,1.6919373273849487),
+				{T=1,M=Enum.Material.Plastic}),
+			["Right Muffin"] = PT("Right Muffin",{"Torso","MuffinsRoot","MuffinTexture"},
+				J("MuffinTexture",{-23.753343753911466,-90.00100654228616,-0.0015776988680143995},
+					{0.4629173278808594,0.34836864471435547,-0.119},
+					{-0.005727926538298948,7.673709013304556e-07,3.9844767716377254e-08},
+					{0.2,0.5000138282775879,-0.25005149841308594}),
+				V3(1.1688451766967773,1.2237967252731323,1.0382230281829834),
+				{M=Enum.Material.Plastic,F={"FrostingDecalCreate","MuffinPhysics"},AS={"Size"},SK="MuffinsScale",
+				 Mesh={Id="rbxassetid://132922517258698",Type=Enum.MeshType.FileMesh,Scale=V3(1,1,0.949999988079071)}}),
+			["Left Muffin"] = PT("Left Muffin",{"Torso","MuffinsRoot","MuffinTexture"},
+				J("MuffinTexture",{-23.758024141040217,-90.00084944793525,-0.000634690138446728},
+					{0.463,0.348,0.115},
+					{-0.005980470948580852,0.0000012838909969340095,3.1865261728779645e-08},
+					{-0.2,0.5000457763671875,-0.25006103515625}),
+				V3(1.1688451766967773,1.2237967252731323,1.0382230281829834),
+				{M=Enum.Material.Plastic,F={"FrostingDecalCreate","MuffinPhysics"},AS={"Size"},SK="MuffinsScale",
+				 Mesh={Id="rbxassetid://85193503766229",Type=Enum.MeshType.FileMesh,Scale=V3(1,1,0.949999988079071)}}),
+			["CherryL"] = MP("CherryL","rbxassetid://5270413936",{"Torso","MuffinsRoot","MuffinTexture","Left Muffin"},
+				J("Left Muffin",{0.00033097537997343055,-90.00002982523485,-0.0022091301382794084},
+					{0.2868417501449585,-0.21349024772644043,0.5333099365234375}),
+				V3(0.09057788550853729,0.11979091912508011,0.09701091796159744),
+				{C=0.9973507482925269,AS={"Size","CFrame"},SK="MuffinsScale"}),
+			["CherryR"] = MP("CherryR","rbxassetid://5270413632",{"Torso","MuffinsRoot","MuffinTexture","Right Muffin"},
+				J("Right Muffin",{0.00038563052015289865,-90.00003665542401,-0.002028779210023687},
+					{-0.28683096170425415,-0.21348357200622559,0.5332927703857422}),
+				V3(0.09057788550853729,0.11979091912508011,0.09701091796159744),
+				{C=0.9973507482925269,AS={"Size","CFrame"},SK="MuffinsScale"}),
+		},
+		Main = {
+			["TorsoMesh2"] = MP("TorsoMesh2","rbxassetid://13755434958",{"Torso","TorsoMesh"},
+				IDJ("TorsoMesh"),V3(2.077857255935669,1.998084545135498,0.966502845287323)),
+			["ShirtTexture"] = MP("ShirtTexture","rbxassetid://13755434958",{"Torso","TorsoMesh","TorsoMesh2"},
+				J("TorsoMesh2",{8.414526155370115e-10,0.000027321046543082452,0.00007513312307429828},
+					{-0.00005054473876953125,0.0006659030914306641,0.00054931640625}),
+				V3(2.0999999046325684,2.0047788619995117,0.9861152768135071),{T=1,M=Enum.Material.Plastic}),
+			["PantsTexture"] = MP("PantsTexture","rbxassetid://13755434958",{"Torso","TorsoMesh","TorsoMesh2"},
+				J("TorsoMesh2",{4.201385512026047e-10,0.000013660376711581505,0.00003756656805092513},
+					{0.0030002593994140625,0.009999990463256836,0.00656890869140625}),
+				V3(2.0999999046325684,2.005000114440918,0.9928628206253052),{T=1,M=Enum.Material.Plastic}),
+		},
+	}
+
+	----------------------------------------------------------------
+	-- CLEMON MALE
+	----------------------------------------------------------------
+	local ClemonMale = {
+		NoUV = false, Limbs = {}, Muffins = {},
+		Donuts = {
+			["Right Donut"] = MP("Right Donut","rbxassetid://6349489786",{"Torso"},
+				J("Torso",{-5.000017783793032,179.999991348578,-20.000028446489814},
+					{0.4845085144042969,-0.93515944480896,0.22857952117919922},
+					{0.00014343431128661913,-0.00017747767561247107,-0.00009069887208357151},
+					{-0.04769861698150635,-0.04167555645108223,0.0037933674175292253}),
+				V3(1.2064599990844727,1.3742135763168335,1.0168464183807373),{F={"DonutPhysics"}}),
+			["Left Donut"] = MP("Left Donut","rbxassetid://6349489786",{"Torso"},
+				J("Torso",{-5.000017783793032,179.999991348578,19.999960144598113},
+					{-0.4805750846862793,-0.9351599216461182,0.24662399291992188},
+					{0.00014812934982564425,-0.00006339245873824529,-0.00017246195085402258},
+					{0.04775483161211014,-0.04152219370007515,0.0019189652521163225}),
+				V3(1.2064599990844727,1.3742135763168335,1.0168464183807373),{F={"DonutPhysics"}}),
+		},
+		Main = {
+			["Meatballs"] = MP("Meatballs","rbxassetid://17248394631",{"Torso"},
+				J("Torso",{-3.9489766925051025e-11,180.00000500895632,4.756078472647471e-18},
+					{-0.0012555122375488281,-0.8132445812225342,-0.2344989776611328},{0,0,-0},{0,0.438,-0.223}),
+				V3(0.7754001617431641,0.8510900735855103,0.45960021018981934),{UV=false}),
+			["Hotdog"] = MP("Hotdog","rbxassetid://17248394821",{"Torso","Meatballs"},
+				J("Meatballs",{0,0,0},{-0,0.401,0.152},{0,-0,0},{0,-0.056,-0.332}),
+				V3(0.426300048828125,0.5736297369003296,1.7439597845077515),
+				{UV=false, F={"MuffinPhysics", createSurfaceAppearance={{ColorMap="rbxassetid://17250389398",Color="Dark"}}},
+				 Ex={Decal={Transparency=0,Color3="255,255,255",ZIndex=1,Face=Enum.NormalId.Front,Texture=""}}}),
+			["PantsUVRight"] = MP("PantsUVRight","rbxassetid://9067214532",{"Torso"},IDJ("Torso"),
+				V3(1.0503069162368774,1.192764401435852,0.8960484862327576),{T=1,M=Enum.Material.Plastic}),
+			["PantsUVLeft"] = MP("PantsUVLeft","rbxassetid://9067214532",{"Torso"},IDJ("Torso"),
+				V3(1.0505504608154297,1.1925383806228638,0.8962461948394775),{T=1,M=Enum.Material.Plastic}),
+			["Right Donut Skin"] = MP("Right Donut Skin","rbxassetid://17106927899",{"Torso","PantsUVRight"},
+				J("PantsUVRight",{-0.0002126963596224283,-0.00010159872518758831,0.00016392405806088292},
+					{0.0038898377679288387,0.00022524081578012556,0.00023232511011883616}),
+				V3(1.0416899919509888,1.167502522468567,0.8917033672332764),{T=1,M=Enum.Material.Plastic}),
+			["Left Donut Skin"] = MP("Left Donut Skin","rbxassetid://17106927899",{"Torso","PantsUVLeft"},
+				J("PantsUVLeft",{0.0007695702203900305,0.0002586932845387132,-0.00029882064591253807},
+					{-0.0015563371125608683,0.0024635307490825653,0.00037139863707125187}),
+				V3(1.0417251586914062,1.1675420999526978,0.8917341828346252),{T=1,M=Enum.Material.Plastic}),
+			["JointGroin"] = PT("JointGroin",{"Torso"},
+				J("Torso",{-0.00021856620977103174,-0.00007461854128505093,0.000030206001184894998},
+					{0.0074176788330078125,-1.0466424226760864,-0.07785677909851074},
+					{0.0002185642816933394,-0.000074618502202395,0.00009061715676380661},
+					{7.391947839420487e-13,0.04999983310699463,-0.09999775886535645}),
+				V3(0.2,0.2,0.2),{T=1,M=Enum.Material.Plastic}),
+			["JointBase"] = PT("JointBase",{"Torso","JointGroin"},
+				J("JointBase",{-0,-90,-0},{0,0,0},{0,-0,0},{0,-0.108,0.038}),
+				V3(0.3874383568763733,0.37226757407188416,0.3225541114807129),
+				{T=1,M=Enum.Material.Plastic,Mesh={Id="rbxassetid://6256925329",Type=Enum.MeshType.FileMesh,
+					Scale=V3(0.5356369018554688,0.535636842250824,0.5356369018554688)}}),
+			["TextPart"] = PT("TextPart",{"Torso","JointGroin","JointBase"},
+				IDJ("JointBase"),V3(0.3874383568763733,0.37226757407188416,0.3225541114807129),
+				{T=1,M=Enum.Material.Plastic,UV=false,
+				 Mesh={Id="rbxassetid://6256925329",Type=Enum.MeshType.FileMesh,
+					Scale=V3(0.535636842250824,0.5356369018554688,0.5356369018554688)},
+				 Ex={JointBase={Transparency=0,Color3="110.00000104308128,110.00000104308128,111.00000098347664",
+					ZIndex=1,Face=Enum.NormalId.Front,Texture="rbxassetid://8097537036"}}}),
+			["Core"] = MP("Core","rbxassetid://9067214532",{"Torso","JointGroin","JointBase"},
+				J("JointBase",{-2.344961343396098e-10,-90.0000639761807,-3.742697345983765e-10},
+					{-0.0201873779296875,0.020062685012817383,0.000362396240234375}),
+				V3(1.3905601501464844,0.6742468476295471,0.861075222492218),{UV=false}),
+			["PantsUV"] = MP("PantsUV","rbxassetid://9067214532",{"Torso","JointGroin","JointBase","Core"},
+				J("Core",{-2.3449593555494214e-10,1.0644055539411293e-20,2.3507106929445118e-11},{0,-0.005310773849487305,0}),
+				V3(1.4199999570846558,0.6925492286682129,0.8795446157455444),{T=1}),
+		},
+	}
+
+	----------------------------------------------------------------
+	-- ROCLOTHES1
+	----------------------------------------------------------------
+	local RoClothes1 = {
+		NoUV = true, Main = {},
+		Limbs = {
+			["Left Leg Mesh"] = MP("Left Leg Mesh","rbxasset://7332360863.mesh",{"Left Leg"},
+				J("Left Leg",{0,-90.00000250447816,0},{-0.035999298095703125,0.06270003318786621,0.04400062561035156}),
+				V3(1.2130000591278076,2.180000066757202,1.2009999752044678)),
+			["Right Leg Mesh"] = MP("Right Leg Mesh","rbxasset://7332415457.mesh",{"Right Leg"},
+				J("Right Leg",{0,-90.00000250447816,0},{0.035999298095703125,0.06270003318786621,0.04400062561035156}),
+				V3(1.2130000591278076,2.180000066757202,1.2009999752044678)),
+			["Left Arm Mesh"] = MP("Left Arm Mesh","rbxasset://11617989163.mesh",{"Left Arm"},
+				J("Left Arm",{0,-179.999991348578,0},{0.034999847412109375,0,0}),V3(1,2,1)),
+			["Right Arm Mesh"] = MP("Right Arm Mesh","rbxasset://11617988681.mesh",{"Right Arm"},
+				J("Right Arm",{0,-179.999991348578,0},{-0.034999847412109375,0,0}),V3(1,2,1)),
+			["Torso Mesh"] = MP("Torso Mesh","rbxasset://13181228593.mesh",{"Torso"},IDJ("Torso"),
+				V3(2.0399999618530273,2.059999942779541,1.059999942779541)),
+		},
+		Muffins = {
+			["Left Muffin"] = MP("Left Muffin","rbxasset://17645666081.mesh",{"Torso"},
+				J("Torso",{-9.819897012189793,-69.079932208862,-10.775415717638836},
+					{-0.2464752197265625,0.6354711055755615,-0.4506988525390625},{0,0,0},{0.20001220703125,0.4000053405761719,0}),
+				V3(1.149999976158142,1.402999997138977,0.9800000190734863),
+				{F={"FrostingDecalCreate","MuffinPhysics"},Ph={PhysicsRotationOffset={X="X",Y="Z",Z="Y"}},
+				 Ex={["Frosting Decal 1"]={Transparency=0,Color3="255,167.00000524520874,169.00000512599945",ZIndex=1,Face=Enum.NormalId.Left,Texture="rbxasset://6667257628.png"},
+					 ["Frosting Decal 2"]={Transparency=0,Color3="255,167.00000524520874,169.00000512599945",ZIndex=1,Face=Enum.NormalId.Left,Texture="rbxasset://6667257628.png"}}}),
+			["Right Muffin"] = MP("Right Muffin","rbxasset://17645666081.mesh",{"Torso"},
+				J("Torso",{9.819924332946474,-110.92005230952682,-10.775247524230524},
+					{0.2464752197265625,0.6354711055755615,-0.4506988525390625},{0,0,0},{0.20001220703125,0.4000053405761719,0}),
+				V3(1.149999976158142,1.402999997138977,0.9800000190734863),
+				{F={"FrostingDecalCreate","MuffinPhysics"},Ph={PhysicsRotationOffset={X="X",Y="Z",Z="Y"}},
+				 Ex={["Frosting Decal 1"]={Transparency=0,Color3="255,167.00000524520874,169.00000512599945",ZIndex=1,Face=Enum.NormalId.Left,Texture="rbxasset://6667257628.png"},
+					 ["Frosting Decal 2"]={Transparency=0,Color3="255,167.00000524520874,169.00000512599945",ZIndex=1,Face=Enum.NormalId.Left,Texture="rbxasset://6667257628.png"}}}),
+			["Cherry"] = MP("Cherry","rbxasset://17645756055.mesh",{"Torso","Left Muffin"},
+				J("Left Muffin",{10.82187295682597,-0.9319453747458013,-90.1579984403589},
+					{-0.5723209381103516,-0.20323443412780762,0.0015048980712890625}),
+				V3(0.1289999932050705,0.06700000166893005,0.1289999932050705),
+				{C=0.9956726629181989,AS={"Size","CFrame"}}),
+			["Cherry.1"] = MP("Cherry.1","rbxasset://17645756055.mesh",{"Torso","Right Muffin"},
+				J("Right Muffin",{-10.821694518133903,-0.995776694190744,-89.83001275641489},
+					{-0.5723209381103516,-0.20323443412780762,0.0015048980712890625}),
+				V3(0.1289999932050705,0.06700000166893005,0.1289999932050705),
+				{C=0.9956726629181989,AS={"Size","CFrame"}}),
+		},
+		Donuts = {
+			["Right Donut"] = MP("Right Donut","rbxasset://13181475663.mesh",{"Torso"},
+				J("Torso",{-0.0045233132050424415,-179.9999230466863,0.0001938536211066386},
+					{0.5320003628730774,-0.962014377117157,0.3290000855922699}),
+				V3(1.2519999742507935,1.2389999628067017,1.2630000114440918),
+				{F={"DonutPhysics"},Shape=Enum.PartType.Ball}),
+			["Left Donut"] = MP("Left Donut","rbxasset://13181475662.mesh",{"Torso"},
+				J("Torso",{-0.004607379059955146,-179.99995036744298,0.0001910779187725787},
+					{-0.5320006608963013,-0.9620146155357361,0.3290000855922699}),
+				V3(1.2519999742507935,1.2389999628067017,1.2630000114440918),
+				{F={"DonutPhysics"},Shape=Enum.PartType.Ball}),
+		},
+	}
+
+	----------------------------------------------------------------
+	-- NEW MORPH: ROBOT  (stiff servos, neon core, antenna wobble)
+	----------------------------------------------------------------
+	local robotMetal = Enum.Material.Metal
+	local robotSteel = {RGB=Color3.fromRGB(142,146,152)}
+	local Robot = {
+		NoUV = true, Tacos = {}, Muffins = {}, Donuts = {},
+		HideHead = false,
+		Limbs = {
+			["Torso Mesh"] = MP("Torso Mesh","rbxasset://13181228593.mesh",{"Torso"},IDJ("Torso"),
+				V3(2.0399999618530273,2.059999942779541,1.059999942779541),{M=robotMetal,T=0.02,unpack and nil or nil}),
+			["Left Arm Mesh"] = MP("Left Arm Mesh","rbxasset://11617989163.mesh",{"Left Arm"},
+				J("Left Arm",{0,-179.999991348578,0},{0.034999847412109375,0,0}),V3(1,2,1),{M=robotMetal}),
+			["Right Arm Mesh"] = MP("Right Arm Mesh","rbxasset://11617988681.mesh",{"Right Arm"},
+				J("Right Arm",{0,-179.999991348578,0},{-0.034999847412109375,0,0}),V3(1,2,1),{M=robotMetal}),
+			["Left Leg Mesh"] = MP("Left Leg Mesh","rbxasset://7332360863.mesh",{"Left Leg"},
+				J("Left Leg",{0,-90.00000250447816,0},{-0.035999298095703125,0.06270003318786621,0.04400062561035156}),
+				V3(1.2130000591278076,2.180000066757202,1.2009999752044678),{M=robotMetal}),
+			["Right Leg Mesh"] = MP("Right Leg Mesh","rbxasset://7332415457.mesh",{"Right Leg"},
+				J("Right Leg",{0,-90.00000250447816,0},{0.035999298095703125,0.06270003318786621,0.04400062561035156}),
+				V3(1.2130000591278076,2.180000066757202,1.2009999752044678),{M=robotMetal}),
+		},
+		Main = {
+			["AntennaRod"] = PT("AntennaRod",{"Torso"},
+				J("Torso",{0,0,90},{0,2.62,0}),V3(1.0,0.1,0.1),
+				{M=robotMetal,Shape=Enum.PartType.Cylinder,RGB=Color3.fromRGB(120,124,130),F={"ServoPhysics"}}),
+			["AntennaTip"] = PT("AntennaTip",{"Torso"},
+				J("Torso",{0,0,0},{0,3.18,0}),V3(0.24,0.24,0.24),
+				{M=Enum.Material.Neon,Shape=Enum.PartType.Ball,RGB=Color3.fromRGB(120,255,120),
+				 F={"ServoPhysics"},IB={Amp=0.05,Speed=2.6},Chain="AntennaRod"}),
+			["EyeVisor"] = PT("EyeVisor",{"Torso"},
+				J("Torso",{0,0,0},{0,2.02,-0.53}),V3(1.45,0.3,0.08),
+				{M=Enum.Material.Neon,RGB=Color3.fromRGB(120,255,160),F={"ServoPhysics"},Chain="Torso Mesh"}),
+			["ChestCore"] = PT("ChestCore",{"Torso"},
+				J("Torso",{0,0,0},{0,0.35,-0.54}),V3(0.55,0.55,0.12),
+				{M=Enum.Material.Neon,Shape=Enum.PartType.Ball,RGB=Color3.fromRGB(90,190,255),F={"ServoPhysics"},IB={Amp=0.03,Speed=1.8}}),
+			["ShoulderPadL"] = PT("ShoulderPadL",{"Torso"},
+				J("Torso",{0,0,0},{-1.55,1.05,0}),V3(1.05,1.05,1.05),
+				{M=robotMetal,Shape=Enum.PartType.Ball,RGB=Color3.fromRGB(120,124,130),F={"ServoPhysics"},Chain="Left Arm"}),
+			["ShoulderPadR"] = PT("ShoulderPadR",{"Torso"},
+				J("Torso",{0,0,0},{1.55,1.05,0}),V3(1.05,1.05,1.05),
+				{M=robotMetal,Shape=Enum.PartType.Ball,RGB=Color3.fromRGB(120,124,130),F={"ServoPhysics"},Chain="Right Arm"}),
+		},
+	}
+
+	----------------------------------------------------------------
+	-- NEW MORPH: GHOST  (floaty, per-axis tuned, chained tail wisps)
+	----------------------------------------------------------------
+	local ghostTint = Color3.fromRGB(175, 220, 255)
+	local function ghostLimb(name, mesh, parent, joint, size)
+		return MP(name, mesh, parent, joint, size, {M=Enum.Material.ForceField, T=0.45, RGB=ghostTint, F={"GhostDrift"}, IB={Amp=0.14,Speed=1.4}})
+	end
+	local Ghost = {
+		NoUV = true, Tacos = {}, Muffins = {}, Donuts = {},
+		HideHead = false,
+		Limbs = {
+			["Torso Mesh"] = ghostLimb("Torso Mesh","rbxasset://13181228593.mesh",{"Torso"},IDJ("Torso"),V3(2.0399999618530273,2.059999942779541,1.059999942779541)),
+			["Left Arm Mesh"] = ghostLimb("Left Arm Mesh","rbxasset://11617989163.mesh",{"Left Arm"},J("Left Arm",{0,-179.999991348578,0},{0.034999847412109375,0,0}),V3(1,2,1)),
+			["Right Arm Mesh"] = ghostLimb("Right Arm Mesh","rbxasset://11617988681.mesh",{"Right Arm"},J("Right Arm",{0,-179.999991348578,0},{-0.034999847412109375,0,0}),V3(1,2,1)),
+			["Left Leg Mesh"] = ghostLimb("Left Leg Mesh","rbxasset://7332360863.mesh",{"Left Leg"},J("Left Leg",{0,-90.00000250447816,0},{-0.035999298095703125,0.06270003318786621,0.04400062561035156}),V3(1.2130000591278076,2.180000066757202,1.2009999752044678)),
+			["Right Leg Mesh"] = ghostLimb("Right Leg Mesh","rbxasset://7332415457.mesh",{"Right Leg"},J("Right Leg",{0,-90.00000250447816,0},{0.035999298095703125,0.06270003318786621,0.04400062561035156}),V3(1.2130000591278076,2.180000066757202,1.2009999752044678)),
+		},
+		Main = {
+			["TailWisp1"] = PT("TailWisp1",{"Torso"},J("Torso",{0,0,0},{0,-1.55,0}),V3(1.5,1.3,1.1),
+				{M=Enum.Material.ForceField,T=0.5,Shape=Enum.PartType.Ball,RGB=ghostTint,F={"GhostDrift"},Chain="Torso Mesh",IB={Amp=0.1,Speed=1.2}}),
+			["TailWisp2"] = PT("TailWisp2",{"Torso","TailWisp1"},J("TailWisp1",{0,0,0},{0,-0.75,0}),V3(1.05,0.95,0.85),
+				{M=Enum.Material.ForceField,T=0.55,Shape=Enum.PartType.Ball,RGB=ghostTint,F={"GhostDrift"},Chain="TailWisp1",IB={Amp=0.12,Speed=1.5}}),
+			["TailWisp3"] = PT("TailWisp3",{"Torso","TailWisp1","TailWisp2"},J("TailWisp2",{0,0,0},{0,-0.6,0}),V3(0.65,0.6,0.55),
+				{M=Enum.Material.ForceField,T=0.6,Shape=Enum.PartType.Ball,RGB=ghostTint,F={"GhostDrift"},Chain="TailWisp2",IB={Amp=0.15,Speed=1.8}}),
+			["SpiritOrb"] = PT("SpiritOrb",{"Torso"},J("Torso",{0,0,0},{0,3.1,0}),V3(0.35,0.35,0.35),
+				{M=Enum.Material.Neon,Shape=Enum.PartType.Ball,RGB=Color3.fromRGB(210,240,255),F={"GhostDrift"},IB={Amp=0.22,Speed=2.1}}),
+		},
+	}
+
+		----------------------------------------------------------------
+		-- NEW MORPH: SNOWMAN  (lazy wobble, coal + carrot, HideHead)
+		----------------------------------------------------------------
+		local Snowman = {
+			NoUV = true, Tacos = {}, Muffins = {}, Donuts = {},
+			HideHead = true, Limbs = {},
+			Main = {
+				["SnowBase"] = PT("SnowBase",{"Torso"},J("Torso",{0,0,0},{0,-1.25,0}),V3(2.7,2.3,2.3),
+					{M=Enum.Material.Sand,Shape=Enum.PartType.Ball,RGB=Color3.fromRGB(235,242,250),F={"SnowPhysics"}}),
+				["SnowMid"] = PT("SnowMid",{"Torso"},J("Torso",{0,0,0},{0,0.55,0}),V3(2.1,2.0,2.0),
+					{M=Enum.Material.Sand,Shape=Enum.PartType.Ball,RGB=Color3.fromRGB(240,246,252),F={"SnowPhysics"},IB={Amp=0.02,Speed=0.9}}),
+				["SnowHead"] = PT("SnowHead",{"Torso"},J("Torso",{0,0,0},{0,2.15,0}),V3(1.6,1.55,1.55),
+					{M=Enum.Material.Sand,Shape=Enum.PartType.Ball,RGB=Color3.fromRGB(245,250,255),F={"SnowPhysics"},IB={Amp=0.03,Speed=1.1}}),
+				["CoalEyeL"] = PT("CoalEyeL",{"Torso","SnowHead"},J("SnowHead",{0,0,0},{-0.28,0.28,-0.72}),V3(0.16,0.16,0.16),
+					{Shape=Enum.PartType.Ball,RGB=coalBlack,F={"SnowPhysics"},Chain="SnowHead"}),
+				["CoalEyeR"] = PT("CoalEyeR",{"Torso","SnowHead"},J("SnowHead",{0,0,0},{0.28,0.28,-0.72}),V3(0.16,0.16,0.16),
+					{Shape=Enum.PartType.Ball,RGB=coalBlack,F={"SnowPhysics"},Chain="SnowHead"}),
+				["CarrotNose"] = PT("CarrotNose",{"Torso","SnowHead"},J("SnowHead",{0,0,0},{0,0.05,-0.95}),V3(0.14,0.14,0.75),
+					{M=Enum.Material.SmoothPlastic,RGB=Color3.fromRGB(255,140,40),F={"SnowPhysics"},Chain="SnowHead"}),
+				["CoalButton1"] = PT("CoalButton1",{"Torso","SnowMid"},J("SnowMid",{0,0,0},{0,0.45,-0.97}),V3(0.2,0.2,0.2),
+					{Shape=Enum.PartType.Ball,RGB=coalBlack,F={"SnowPhysics"},Chain="SnowMid"}),
+				["CoalButton2"] = PT("CoalButton2",{"Torso","SnowMid"},J("SnowMid",{0,0,0},{0,-0.05,-1.0}),V3(0.2,0.2,0.2),
+					{Shape=Enum.PartType.Ball,RGB=coalBlack,F={"SnowPhysics"},Chain="SnowMid"}),
+				["CoalButton3"] = PT("CoalButton3",{"Torso","SnowMid"},J("SnowMid",{0,0,0},{0,-0.55,-0.96}),V3(0.2,0.2,0.2),
+					{Shape=Enum.PartType.Ball,RGB=coalBlack,F={"SnowPhysics"},Chain="SnowMid"}),
+				["StickArmL"] = PT("StickArmL",{"Torso"},J("Torso",{0,0,64},{-1.75,1.0,0}),V3(1.5,0.12,0.12),
+					{M=Enum.Material.Wood,Shape=Enum.PartType.Cylinder,RGB=Color3.fromRGB(96,68,44),F={"SnowPhysics"},IB={Amp=0.04,Speed=1.3}}),
+				["StickArmR"] = PT("StickArmR",{"Torso"},J("Torso",{0,0,-64},{1.75,1.0,0}),V3(1.5,0.12,0.12),
+					{M=Enum.Material.Wood,Shape=Enum.PartType.Cylinder,RGB=Color3.fromRGB(96,68,44),F={"SnowPhysics"},IB={Amp=0.04,Speed=1.3}}),
+				["Scarf"] = PT("Scarf",{"Torso"},J("Torso",{0,0,0},{0,1.35,0}),V3(1.5,0.32,1.5),
+					{M=Enum.Material.Fabric,Shape=Enum.PartType.Ball,RGB=Color3.fromRGB(200,50,55),F={"SnowPhysics"},IB={Amp=0.03,Speed=1.7}}),
+				["ScarfTail"] = PT("ScarfTail",{"Torso","Scarf"},J("Scarf",{18,0,0},{0.45,-0.65,0.35}),V3(0.34,1.1,0.14),
+					{M=Enum.Material.Fabric,RGB=Color3.fromRGB(200,50,55),F={"SnowPhysics"},Chain="Scarf"}),
+			},
+		}
+
+		return {
+			ClemonFemale = ClemonFemale,
+			ClemonMale   = ClemonMale,
+			RoClothes1   = RoClothes1,
+			Robot        = Robot,
+			Ghost        = Ghost,
+			Slime        = Slime,
+			Snowman      = Snowman,
+		}
+	end
+--#endregion
+
+--#region ██ UTIL / MATH ██
+local Function = {}
+
+function Function.PlayerDataDefault()
+	return {
+		CurrentClothes = {}, StashedClothing = {}, HiddenVanilla = {}, Conns = {},
+		MuffinsScale = 2, DonutsScale = 100,
+		BodyPartPhysics = true, BodyPhysics = true,
+		PhysicsOn = true, BobOn = true,
+		UVToggle = false, ColorPresetIndex = 1, QualityIndex = 1, -- 1=auto
+		Building = false, PendingBuild = false,
+		SelectedMorphName = "ClemonFemale",
+		SquashSpring = Spring.new(Vector3.zero),
+		GlitchUntil = 0, GlitchMag = 0,
+		ReadyT0 = 0,
+		FootAccum = 0, FootSide = 1,
+		FaceTarget = {Mouth = 0.5, Brow = 0, Emotion = "Happy"},
+		deferredWelds = {},
+		colorConfig = {Values = {
+			["163, 162, 165"] = 0,
+			["134, 133, 135"] = 0.17,
+			["110, 110, 111"] = 0.32,
+		}},
+		CurrentPartList = {
+			Organ = {}, Clothes = {}, Accessory = {}, BodyPartPhysics = {},
+			FrostingDecal = {}, FaceKit = nil, EmitterCache = {},
+			RealtimeUpdateList = {Mesh = {}, Accessory = {}},
+		},
+	}
+end
+
+function Function.PlayerDataAdd(name)
+	if not PlayerData[name] then PlayerData[name] = Function.PlayerDataDefault() end
+	return PlayerData[name]
+end
+
+function Function.MultiplyCalculate(Base, Default)
+	return Base.X/Default.X, Base.Y/Default.Y, Base.Z/Default.Z
+end
+function Function.TabletoVector(t) return Vector3.new(t.x, t.y, t.z) end
+function Function.StringtoColor3(str)
+	local r,g,b = str:match("([^,]+),([^,]+),([^,]+)")
+	return Color3.fromRGB(math.round(tonumber(r) or 0), math.round(tonumber(g) or 0), math.round(tonumber(b) or 0))
+end
+function Function.TabletoString(v, spaces, semi, depth)
+	spaces = spaces or 4
+	if type(v) ~= "table" then return type(v)=="string" and ('"%s"'):format(v) or tostring(v) end
+	if not next(v) then return "{}" end
+	depth = depth or 1
+	local pad = (" "):rep(depth*spaces)
+	local sep = semi and ";" or ","
+	local out = {"{"}
+	for k,x in next,v do
+		out[#out+1] = ("\n%s[%s] = %s%s"):format(pad, type(k)=="number" and k or ('"%s"'):format(tostring(k)),
+			Function.TabletoString(x, spaces, semi, depth+1), sep)
+	end
+	local s = table.concat(out)
+	return ("%s\n%s}"):format(s:sub(1,-2), pad:sub(1,-spaces-1))
+end
+function Function.StringtoTable(str)
+	local tbl = {}
+	for k,v in str:gmatch('%[\"(.-)\"%] = \"(.-)\"') do tbl[k] = v end
+	return tbl
+end
+function Function.Table2CF(t)
+	if type(t) ~= "table" then return t end
+	local r,p = t.Rotation, t.Position
+	return CFrame.new(p.x,p.y,p.z) * CFrame.fromEulerAnglesYXZ(math.rad(r.x),math.rad(r.y),math.rad(r.z))
+end
+function Function.DarkenColor(c,a) return c:Lerp(Color3.new(0,0,0), a) end
+function Function.CFrameMultiply(cf,m)
+	return CFrame.new(cf.Position.X*m.X, cf.Position.Y*m.Y, cf.Position.Z*m.Z) * cf.Rotation
+end
+function Function.Vector3Multiply(v,m) return Vector3.new(v.X*m.X, v.Y*m.Y, v.Z*m.Z) end
+function Function.CompareVector3(a,b)
+	return math.abs(a.X)<=b.X, math.abs(a.Y)<=b.Y, math.abs(a.Z)<=b.Z
+end
+function Function.FallenPartCheck(obj)
+	return obj:IsA("BasePart") and obj.Parent and obj.Position.Y < workspace.FallenPartsDestroyHeight
+end
+
+-- resolve current quality tier (resolves "auto" via FPS watcher)
+local QualityTier, FPSAvg = "High", 60
+local QUALITY_ORDER = {"Low","Medium","High"}
+local function QualityLevel() -- 1..3
+	if PlayerData[LocalPlayer.Name] and PlayerData[LocalPlayer.Name].QualityIndex > 1 then
+		return PlayerData[LocalPlayer.Name].QualityIndex - 1
+	end
+	return QualityTier == "Low" and 1 or QualityTier == "Medium" and 2 or 3
+end
+--#endregion
+
+--#region ██ SOUND / PARTICLE FX KIT ██ (offline rbxasset only — no HTTP)
+local SoundKit = {
+	Ping    = {"rbxasset://sounds/electronicpingshort.wav", 0.5},
+	Snap    = {"rbxasset://sounds/snap.mp3",                0.6},
+	Jump    = {"rbxasset://sounds/action_jump.mp3",         0.35},
+	Land    = {"rbxasset://sounds/action_get_up.mp3",       0.4},
+	Step    = {"rbxasset://sounds/action_footsteps_plastic.mp3", 0.25},
+	Glitch  = {"rbxasset://sounds/impact_water.mp3",        0.35},
+}
+local function PlaySound(kind, parent, pitch, vol)
+	local def = SoundKit[kind]; if not def then return end
+	pcall(function()
+		local s = Instance.new("Sound")
+		s.SoundId = def[1]; s.Volume = vol or def[2]
+		s.PlaybackSpeed = pitch or 1
+		s.Parent = parent or SoundService
+		s:Play()
+		s.Ended:Once(function() s:Destroy() end)
+		Debris:AddItem(s, 4)
+	end)
+end
+
+local TEX_SPARK = "rbxasset://textures/particles/sparkles_main.dds"
+local TEX_SMOKE = "rbxasset://textures/particles/smoke_main.dds"
+
+local function GetEmitter(dataName, part, kind)
+	local pd = PlayerData[dataName]; if not pd then return nil end
+	local cache = pd.CurrentPartList.EmitterCache
+	if cache[part] then return cache[part] end
+	local pe = Instance.new("ParticleEmitter")
+	if kind == "trail" then
+		pe.Texture = TEX_SPARK; pe.Rate = 40; pe.Lifetime = NumberRange.new(0.25,0.5)
+		pe.Speed = NumberRange.new(1,2); pe.Size = NumberSequence.new(0.35,0)
+		pe.LightEmission = 0.8; pe.Color = ColorSequence.new(Color3.fromRGB(180,220,255))
+	else -- puff
+		pe.Texture = TEX_SMOKE; pe.Rate = 0; pe.Lifetime = NumberRange.new(0.3,0.6)
+		pe.Speed = NumberRange.new(2,4); pe.SpreadAngle = Vector2.new(35,35)
+		pe.Size = NumberSequence.new{NumberSequenceKeypoint.new(0,0.4),NumberSequenceKeypoint.new(1,0.9)}
+		pe.Transparency = NumberSequence.new{NumberSequenceKeypoint.new(0,0.4),NumberSequenceKeypoint.new(1,1)}
+	end
+	pe.Enabled = false; pe.Parent = part
+	cache[part] = pe
+	return pe
+end
+--#endregion
+
+--#region ██ PHYSICS PROFILES + REGISTRATION ██
+local PHYSICS = {
+	MuffinPhysics   = {Speed=10,  Damper=0.2,  Drag=0.6,  Squish=true,  SquishGain=1,
+		PosOff={X="Y",Y="Z",Z="X"}, PosGain={X=0,Y=0,Z=0}, RotOff={X="Y",Y="Z",Z="X"}, RotGain={X=5,Y=-5,Z=5}, ChainK=0.4},
+	MuffinUVPhysics = {Speed=7.5, Damper=0.35, Drag=0.6,  Squish=false,
+		PosOff={X="Y",Y="Z",Z="X"}, PosGain={X=0,Y=0,Z=0}, RotOff={X="Y",Y="Z",Z="Z"}, RotGain={X=5,Y=-5,Z=5}, ChainK=0.4},
+	DonutPhysics    = {Speed=15,  Damper=0.065,Drag=0.5,  Squish=true,  SquishGain=1,
+		PosOff={X="X",Y="Y",Z="Z"}, PosGain={X=0.005,Y=0.00526,Z=0.005}, RotOff={X="Z",Y="Y",Z="X"}, RotGain={X=2.5,Y=-5,Z=-2}, ChainK=0.3},
+	ServoPhysics    = {Speed=22,  Damper=0.9,  Drag=1.8,  MaxDisplace=1.2, Squish=false,
+		PosOff={X="X",Y="Y",Z="Z"}, PosGain={X=0,Y=0,Z=0}, RotOff={X="Z",Y="Y",Z="X"}, RotGain={X=1.2,Y=-1.2,Z=1.2}, ChainK=0.8},
+	GhostDrift      = {Speed=3.2, Damper=0.15, Drag=0.25, MaxDisplace=4, Squish=false,
+		PosOff={X="X",Y="Y",Z="Z"}, PosGain={X=0.01,Y=0.03,Z=0.01}, RotOff={X="Z",Y="X",Z="Y"}, RotGain={X=3,Y=2,Z=-3},
+		Axis={X={Speed=3.6,Damper=0.2},Y={Speed=2.2,Damper=0.1},Z={Speed=3.4,Damper=0.2}}, ChainK=0.5},
+	JellyPhysics    = {Speed=6,   Damper=0.08, Drag=0.4,  Squish=true,  SquishGain=1.7,
+		PosOff={X="Y",Y="Z",Z="X"}, PosGain={X=0,Y=0.01,Z=0}, RotOff={X="Y",Y="Z",Z="X"}, RotGain={X=6,Y=-6,Z=6}, ChainK=0.6},
+	SnowPhysics     = {Speed=4.5, Damper=0.55, Drag=1.1,  Squish=false,
+		PosOff={X="X",Y="Y",Z="Z"}, PosGain={X=0,Y=0.004,Z=0}, RotOff={X="Z",Y="X",Z="Y"}, RotGain={X=2,Y=-2.5,Z=2}, ChainK=0.35},
+}
+
+local function ResolveSpringFunction(fnName)
+	return function(obj, char, extra, dataName)
+		local prof = PHYSICS[fnName]; if not prof then return end
+		local pd = Function.PlayerDataAdd(dataName)
+		if not pd.BodyPartPhysics then return end
+		local weld = obj:FindFirstChildOfClass("Motor6D")
+		if not weld then return warnf("No Motor6D on "..obj.Name) end
+		local base = weld.Part0
+		local spr = Spring.new(Vector3.zero)
+		spr.Speed, spr.Damper = prof.Speed, prof.Damper
+		spr.AirDrag = prof.Drag or 0.6
+		spr.MaxDisplace = prof.MaxDisplace or 8
+		if prof.Axis then spr:ConfigureAxis(prof.Axis) end
+		-- allow per-part PhysicsRotationOffset override (legacy attr)
+		local rotOff = prof.RotOff
+		local attr = obj:GetAttribute("PhysicsRotationOffset")
+		if attr then
+			local parsed = Function.StringtoTable(attr)
+			rotOff = {X=parsed.X or "X", Y=parsed.Y or "Y", Z=parsed.Z or "Z"}
+		end
+		local bob = obj:GetAttribute("IdleBob")
+		pd.CurrentPartList.BodyPartPhysics[obj] = {
+			Spring = spr, Base = base, Weld = weld, Profile = prof,
+			RotOff = rotOff, PosOff = prof.PosOff,
+			OriginCFrame = base.CFrame, Phase = Clock()*7 + math.random()*6.28,
+			PrevVel = Vector3.zero, SkipTime = 0, SizeFactor = Vector3.one,
+			Chain = obj:GetAttribute("Chain"), ChainEntry = nil,
+			BobAmp = bob and tonumber(bob) or nil,
+		}
+	end
+end
+for name in pairs(PHYSICS) do Function[name] = ResolveSpringFunction(name) end
+
+function Function.FrostingDecalCreate(obj, char, extra, dataName)
+	pcall(function()
+		local d = Instance.new("Decal")
+		d.Name = "Frosting Decal"
+		d.Texture = "http://www.roblox.com/asset/?id=9065282081"
+		d.Face = Enum.NormalId.Right
+		d.Color3 = Function.DarkenColor(char.Torso.Color, 0.32)
+		d.Parent = obj
+		Function.PlayerDataAdd(dataName).CurrentPartList.FrostingDecal[d] = obj
+	end)
+end
+
+function Function.createSurfaceAppearance(obj, char, extra, dataName, payload)
+	payload = type(payload)=="table" and payload[1] or payload
+	pcall(function()
+		if IsStudio then return warnf("Studio detected — SurfaceAppearance skipped") end
+		if not payload or not payload.ColorMap then return end
+		local sa = Instance.new("SurfaceAppearance")
+		sa.ColorMap = payload.ColorMap
+		sa.AlphaMode = Enum.AlphaMode.Overlay
+		sa.Name = "SurfaceAppearance"
+		if payload.Color == "Dark" then
+			sa.Color3 = Function.DarkenColor(char.Torso.Color, 0.35)
+		elseif typeof(payload.Color) == "Color3" then
+			sa.Color3 = payload.Color
+		end
+		sa.Parent = obj
+	end)
+end
+
+function Function.ApplyUV(obj, char, extra)
+	local n = obj.Name:lower()
+	if not (n:find("uv") or n:find("texture")) then return end
+	if n:find("shirt") or n:find("muffin") or n:find("chest") or n:find("torso") or n:find("arm") then
+		obj.TextureID = extra.Shirt and extra.Shirt.ShirtTemplate or obj.TextureID
+	end
+	if n:find("pant") or n:find("donut") or n:find("butt") or n:find("leg") then
+		obj.TextureID = extra.Pants and extra.Pants.PantsTemplate or obj.TextureID
+	end
+	obj.Transparency = 0.02
+end
+--#endregion
+
+--#region ██ WELDING SYSTEM ██
+local PART_LISTS = nil -- filled at bootstrap (needs globals aliased first)
+
+function Function.Weld(cfg, char, extra, dataName)
+	local pd = Function.PlayerDataAdd(dataName)
+	local ok, result = pcall(function()
+		local NAME      = cfg.Name
+		local PARENT    = cfg.Parent or {"Torso"}
+		if not PARENT[1] then PARENT[1] = "Torso" end
+
+		local CFRAME    = cfg.Joint and cfg.Joint.CFrame  or {Rotation={x=0,y=0,z=0},Position={x=0,y=0,z=0}}
+		local CFRAME1   = cfg.Joint and cfg.Joint.CFrame1 or {Rotation={x=0,y=0,z=0},Position={x=0,y=0,z=0}}
+		local SIZE      = cfg.Size or {x=1,y=1,z=1}
+		local ADJUST    = cfg.AdjustScale
+		local SCALEKEY  = cfg.ScaleKey
+
+		-- locate root body part + size multipliers
+		local BodyPart = char.Morph:FindFirstChild(PARENT[1])
+		if BodyPart == nil or BodyPartSize[BodyPart.Name] == nil then BodyPart = char.Torso end
+		local XM, YM, ZM = Function.MultiplyCalculate(BodyPart.Size, BodyPartSize[BodyPart.Name])
+
+		-- resolve deep parent chain inside Morph
+		local parent = char.Morph
+		for i = 1, #PARENT do
+			parent = parent and parent:FindFirstChild(PARENT[i])
+			if not parent then break end
+		end
+		if parent == nil then
+			local root = PARENT[#PARENT]
+			pd.deferredWelds[root] = pd.deferredWelds[root] or {}
+			table.insert(pd.deferredWelds[root], cfg)
+			return dprint("Deferred:", NAME, "(missing "..root..")")
+		end
+
+		-- accessory scale keys ([ and ] hotkeys)
+		local Scale = 1
+		if SCALEKEY and pd[SCALEKEY] then
+			local sVal = pd[SCALEKEY]
+			Scale = (sVal >= 1) and (1 + (sVal-1)/5) or (1 + (sVal-1)/10)
+			if sVal == 1 then Scale = 1 end
+			if ADJUST == nil or table.find(ADJUST, "Size") then
+				SIZE = Function.Vector3Multiply(Function.TabletoVector(SIZE), {X=Scale,Y=Scale,Z=Scale})
+			end
+			if ADJUST == nil or table.find(ADJUST, "CFrame1") then
+				CFRAME1 = Function.CFrameMultiply(Function.Table2CF(CFRAME1), {X=Scale,Y=Scale,Z=Scale})
+			end
+			if ADJUST and table.find(ADJUST, "CFrame") then
+				CFRAME = Function.CFrameMultiply(Function.Table2CF(CFRAME), {X=Scale,Y=Scale,Z=Scale})
+			end
+		end
+
+		-- build the instance
+		local obj
+		if cfg.Instance == "Mesh" then
+			local okM, meshOrErr = pcall(function()
+				return InsertService:CreateMeshPartAsync(cfg.MeshId, Enum.CollisionFidelity.Box, Enum.RenderFidelity.Performance)
+			end)
+			if okM then
+				obj = meshOrErr
+				if cfg.TextureId then obj.TextureID = cfg.TextureID end
+				obj.Color = Color3.new(1,1,1) -- let Color prop below win over texture bake
+			else
+				warnf(("Mesh %s failed (%s) — substituting block"):format(NAME, tostring(meshOrErr)))
+				obj = Instance.new("Part")
+			end
+		else
+			obj = Instance.new("Part")
+			obj.Shape = cfg.Shape or Enum.PartType.Block
+			local mc = cfg.Mesh
+			if mc then
+				local mesh = Instance.new("SpecialMesh")
+				mesh.Name = NAME..".Mesh"
+				local mScale = Function.TabletoVector(mc.Scale)
+				mesh.MeshType = mc.MeshType or Enum.MeshType.Sphere
+				mesh.MeshId = mc.MeshId or ""
+				mesh.TextureId = mc.TextureId or ""
+				mesh.Scale = (mesh.MeshType == Enum.MeshType.FileMesh)
+					and Function.Vector3Multiply(mScale, {X=XM*Scale, Y=YM*Scale, Z=ZM*Scale})
+					or mScale
+				mesh.Parent = obj
+			end
+		end
+
+		-- core props
+		obj.Name = cfg.Name
+		obj.CanCollide, obj.CanQuery, obj.CanTouch, obj.Massless = false, false, false, true
+		obj.CastShadow = false
+		obj.Transparency = cfg.Transparency or 0
+		obj.Material = cfg.Material or Enum.Material.SmoothPlastic
+		if cfg.ReflectanceHint then obj.Reflectance = 0.08 end
+
+		-- extras → decals (respect authored Color3; fall back to darkened torso)
+		if cfg.Extra then
+			for exName, prop in pairs(cfg.Extra) do
+				local d = Instance.new("Decal")
+				d.Name = exName
+				d.Transparency = prop.Transparency or 0
+				d.ZIndex = prop.ZIndex or 1
+				d.Face = prop.Face or Enum.NormalId.Front
+				d.Texture = prop.Texture or ""
+				d.Color3 = prop.Color3 and Function.StringtoColor3(prop.Color3)
+					or Function.DarkenColor(char.Torso.Color, 0.32)
+				d.Parent = obj
+				pd.CurrentPartList.FrostingDecal[d] = obj
+			end
+		end
+
+		-- weld
+		local weld = Instance.new("Motor6D")
+		weld.Name = NAME.." Weld"
+		weld.C0 = Function.CFrameMultiply(Function.Table2CF(CFRAME), {X=XM,Y=YM,Z=ZM})
+		weld.C1 = Function.CFrameMultiply(Function.Table2CF(CFRAME1), {X=XM,Y=YM,Z=ZM})
+		obj.Size = Function.Vector3Multiply(Function.TabletoVector(SIZE), {X=XM,Y=YM,Z=ZM})
+		obj.Parent = parent
+		weld.Part0, weld.Part1 = parent, obj
+		weld.Parent = obj
+
+		if cfg.Physics and cfg.Physics.PhysicsRotationOffset then
+			obj:SetAttribute("PhysicsRotationOffset", Function.TabletoString(cfg.Physics.PhysicsRotationOffset))
+		end
+		if cfg.Chain then obj:SetAttribute("Chain", cfg.Chain) end
+		if cfg.IdleBob then obj:SetAttribute("IdleBob", tostring(cfg.IdleBob.Amp)) end
+
+		-- color: explicit RGB > numeric-accent legacy > Base
+		if typeof(cfg.RGB) == "Color3" then
+			obj.Color = cfg.RGB
+		elseif cfg.Color ~= nil and cfg.Color ~= "Base" then
+			obj.Color = Function.DarkenColor(char.Torso.Color, pd.colorConfig.Values["110, 110, 111"])
+		else
+			obj.Color = char.Torso.Color
+		end
+
+		-- function dispatch: numbered = named handlers, keyed = handler+payload
+		if cfg.Function then
+			for k, v in pairs(cfg.Function) do
+				pcall(function()
+					if type(k) == "number" then
+						if type(Function[v]) == "function" then Function[v](obj, char, extra, dataName) end
+					elseif type(Function[k]) == "function" then
+						Function[k](obj, char, extra, dataName, v)
+					end
+				end)
+			end
+		end
+
+		-- UV-mode overrides
+		if extra.UVToggle then
+			local lower = NAME:lower()
+			if lower:find("cherry") or lower:find("donut") then obj.Transparency = 1 end
+			if lower:find("skin") then obj.Transparency = 0 end
+			if cfg.UV == false then obj.Transparency = 1 end
+			local stale = {}
+			for d in pairs(pd.CurrentPartList.FrostingDecal) do
+				if d:IsA("Decal") and d.Name == "Frosting Decal" then table.insert(stale, d) end
+			end
+			for _,d in ipairs(stale) do pd.CurrentPartList.FrostingDecal[d] = nil; d:Destroy() end
+			local taco = char.Morph:FindFirstChild("TacoShell")
+			if taco then taco:Destroy() end
+			Function.ApplyUV(obj, char, extra)
+		end
+
+		pd.CurrentPartList.Organ[obj] = true
+		pd.CurrentPartList.RealtimeUpdateList.Mesh[obj] = {
+			Name = NAME, RawSize = Function.TabletoVector(SIZE),
+			C0 = weld.C0, C1 = weld.C1, Base = BodyPart, Weld = weld,
+			BaseSize = BodyPart.Size, HasPhysics = false,
+			SizeFactor = Vector3.one, ReadyOff = nil,
+		}
+
+		-- unblock anything waiting on this name
+		if pd.deferredWelds[NAME] then
+			local queue = pd.deferredWelds[NAME]
+			pd.deferredWelds[NAME] = nil
+			for _, pendingCfg in ipairs(queue) do
+				Function.Weld(pendingCfg, char, extra, dataName)
+			end
+		end
+		return obj
+	end)
+	if not ok then warnf("Weld failed for "..tostring(cfg.Name)..": "..tostring(result)) end
+	return result
+end
+--#endregion
+
+--#region ██ CHARACTER PIPELINE ██
+local function CreateR6Template() -- (kept from original API surface)
+	local m = Instance.new("Model")
+	Instance.new("Humanoid", m)
+	local root = Instance.new("Part"); root.Name="HumanoidRootPart"; root.Size=Vector3.new(2,2,1)
+	root.Anchored, root.Transparency = true, 1; root.Parent=m; m.PrimaryPart=root
+	for n,p in pairs(R6Map) do
+		local pt = Instance.new("Part"); pt.Name=n; pt.Size=p.Size
+		pt.CFrame=root.CFrame*p.Offset; pt.Anchored=true; pt.Transparency=1; pt.Parent=m
+	end
+	for n,j in pairs(R6Joints) do
+		local mo=Instance.new("Motor6D"); mo.Name=n; mo.C0=j.C0; mo.C1=j.C1
+		mo.Part0=m[j.Part0]; mo.Part1=m[j.Part1]; mo.Parent=m[j.Part0]
+	end
+	return m
+end
+
+local function ParseCharacter(char, dataName)
+	local pd = Function.PlayerDataAdd(dataName)
+	for _, v in ipairs(char:GetChildren()) do
+		if v:IsA("BasePart") and v.Name ~= "Head" then
+			v.Transparency = 1
+			table.insert(pd.HiddenVanilla, v)
+		end
+	end
+	for name, bp in pairs(R6Map) do -- graft missing R6 limbs onto R15
+		if not char:FindFirstChild(name) then
+			local p = Instance.new("Part")
+			p.Name=name; p.Size=bp.Size; p.Transparency=1
+			p.CanCollide,p.CanQuery,p.CanTouch,p.Massless=false,false,false,true
+			p.Color=char.Head.Color; p.Parent=char
+			local sm=Instance.new("SpecialMesh"); sm.MeshId="rbxassetid://12221758"; sm.Parent=p
+			if name~="Torso" then sm.Scale=Vector3.new(0.5,1,1) end
+			pd.CurrentPartList.Organ[p]=true
+			pd.HiddenVanilla[#pd.HiddenVanilla+1] = nil -- grafted parts die with reset
+		end
+	end
+	for name, j in pairs(R6_2_R15) do
+		local p0 = char:FindFirstChild(j.Part0); local p1 = char:FindFirstChild(j.Part1)
+		if p0 and p1 and not char:FindFirstChild(name) then
+			local mo=Instance.new("Motor6D"); mo.Name=name
+			mo.C0=j.C0; mo.C1=j.C1 or CFrame.new(); mo.Part0=p0; mo.Part1=p1; mo.Parent=p0
+			pd.Conns[#pd.Conns+1]={Instance=mo} -- dies with instance anyway
+		end
+	end
+end
+
+function Function.CharacterReset(char, dataName)
+	if not char or not char.Parent then return end
+	local pd = PlayerData[dataName]; if not pd then return end
+	local plist = pd.CurrentPartList
+
+	for inst in pairs(plist.Organ) do pcall(function() inst:Destroy() end) end
+	for inst in pairs(plist.Accessory) do pcall(function() inst:Destroy() end) end
+	for decal in pairs(plist.FrostingDecal) do pcall(function() decal:Destroy() end) end
+	for inst in pairs(plist.Clothes) do pcall(function() inst:Destroy() end) end
+	for _, c in ipairs(pd.StashedClothing) do pcall(function() c.Parent = char end) end
+
+	local morph = char:FindFirstChild("Morph")
+	if morph then morph:Destroy() end
+
+	for _, v in ipairs(pd.HiddenVanilla) do
+		if v and v.Parent then pcall(function() v.Transparency = 0 end) end
+	end
+
+	pd.HiddenVanilla, pd.StashedClothing = {}, {}
+	pd.CurrentPartList = Function.PlayerDataDefault().CurrentPartList
+	pd.BodyPartPhysicsLive = nil
+	pd.deferredWelds = {}
+	pd.SquashSpring = Spring.new(Vector3.zero)
+	pd.FootAccum, pd.GlitchUntil = 0, 0
+end
+
+function Function.CharacterExecute(char, dataName)
+	if not char or not char.Parent then return end
+	local pd = Function.PlayerDataAdd(dataName)
+	if pd.Building then pd.PendingBuild = true; return end
+	pd.Building = true
+
+	task.spawn(function()
+		local ok, err = pcall(function()
+			Function.CharacterReset(char, dataName)
+			local morphDef = PART_LISTS[pd.SelectedMorphName] or PART_LISTS.ClemonFemale
+
+			local hum = char:FindFirstChildOfClass("Humanoid")
+			local extra = {
+				Shirt = char:FindFirstChildOfClass("Shirt"),
+				Pants = char:FindFirstChildOfClass("Pants"),
+				TShirt = char:FindFirstChildOfClass("ShirtGraphic"),
+				UVToggle = pd.UVToggle,
+			}
+			if morphDef.NoUV then extra.UVToggle = false end
+
+			-- stash real clothes when running mesh mode (restored on reset)
+			if not extra.UVToggle then
+				for _, c in ipairs({extra.Shirt, extra.Pants, extra.TShirt}) do
+					if c then c.Parent = char.PrimaryPart; table.insert(pd.StashedClothing, c) end
+				end
+			end
+
+			if hum and hum.RigType == Enum.HumanoidRigType.R15 then
+				ParseCharacter(char, dataName)
+			end
+
+			-- container rig
+			local morph = Instance.new("Model")
+			morph.Name = "Morph"; morph.Parent = char
+			pd.CurrentPartList.Organ[morph] = true
+
+			local function container(name, size)
+				local p = Instance.new("Part")
+				p.Name=name; p.Size=size; p.Transparency=1
+				p.CanCollide,p.CanQuery,p.CanTouch,p.Massless=false,false,false,true
+				local w = Instance.new("Weld"); w.Name=name.."_Weld"
+				p.Parent = morph
+				local src = char:FindFirstChild(name)
+				if src then
+					w.Part0, w.Part1 = src, p
+					p.Color = src.Color
+					src.Transparency = 0
+					pd.HiddenVanilla[#pd.HiddenVanilla+1] = src
+				end
+				w.Parent = p
+				return p
+			end
+			container("Torso", Vector3.new(2,2,1))
+			container("Right Leg", Vector3.new(1,2,1))
+			container("Left Leg", Vector3.new(1,2,1))
+			container("Right Arm", Vector3.new(1,2,1))
+			container("Left Arm", Vector3.new(1,2,1))
+
+			-- hide the real head if the morph replaces it
+			if morphDef.HideHead and char:FindFirstChild("Head") then
+				char.Head.Transparency = 1
+				pd.HiddenVanilla[#pd.HiddenVanilla+1] = char.Head
+				for _, d in ipairs(char.Head:GetChildren()) do
+					if d:IsA("Decal") then d.Transparency = 1 end
+				end
+			end
+
+			-- weld all groups (each isolated — one bad asset can't kill the morph)
+			local groups = {"Limbs","Main","Muffins","Donuts"}
+			for _, g in ipairs(groups) do
+				local grp = morphDef[g]
+				if type(grp) == "table" then
+					for _, cfg in pairs(grp) do
+						if type(cfg)=="table" and cfg.Name then
+							if g=="Muffins" and cfg.ScaleKey==nil then cfg.ScaleKey="MuffinsScale" end
+							if g=="Donuts"  and cfg.ScaleKey==nil then cfg.ScaleKey="DonutsScale" end
+							Function.Weld(cfg, char, extra, dataName)
+						end
+					end
+				end
+			end
+			if type(morphDef.Tacos) == "table" then
+				for _, shellSet in ipairs(morphDef.Tacos) do
+					local shell = container("TacoShell", Vector3.new(2,2,1))
+					shell.Color = char.Torso.Color
+					for _, cfg in pairs(shellSet) do Function.Weld(cfg, char, extra, dataName) end
+				end
+			end
+
+			-- flush any deferred welds (bounded passes)
+			for _ = 1, 5 do
+				local remaining = 0
+				for root, queue in pairs(pd.deferredWelds) do
+					pd.deferredWelds[root] = nil
+					remaining += #queue
+					for _, cfg in ipairs(queue) do Function.Weld(cfg, char, extra, dataName) end
+				end
+				if remaining == 0 then break end
+			end
+
+			-- READY-UP: seed random offsets that spring-spin home
+			pd.ReadyT0 = Clock()
+			for inst, entry in pairs(pd.CurrentPartList.RealtimeUpdateList.Mesh) do
+				entry.ReadyOff = CFrame.new(
+					(math.random()-0.5)*2.4,(math.random()-0.5)*2.4,(math.random()-0.5)*2.4
+				) * CFrame.Angles(
+					math.rad((math.random()-0.5)*260),
+					math.rad((math.random()-0.5)*260),
+					math.rad((math.random()-0.5)*260))
+			end
+
+			BuildFaceKit(char, pd, morphDef)
+			BindCharacterEvents(char, dataName)
+			PlaySound("Ping", char.Head or char.PrimaryPart, 1.25)
+			PlaySound("Snap", char.Head or char.PrimaryPart, 0.9)
+			dprint("Applied '"..pd.SelectedMorphName.."' to "..dataName)
+		end)
+		if not ok then warnf("CharacterExecute error: "..tostring(err)) end
+		pd.Building = false
+		if pd.PendingBuild then pd.PendingBuild = false; Function.CharacterExecute(char, dataName) end
+	end)
+end
+--#endregion
+
+--#region ██ FACE EXPRESSIONS / FOOTSTEPS / GLITCH ██
+local EMOTION_COLORS = {Happy=Color3.new(1,1,1), Scared=Color3.fromRGB(160,200,255),
+	Angry=Color3.fromRGB(255,120,100), Dizzy=Color3.fromRGB(255,230,120)}
+
+function BuildFaceKit(char, pd, morphDef)
+	pcall(function()
+		if morphDef == PART_LISTS.Robot then return end -- visor IS the face
+		local head = char:FindFirstChild("Head")
+		if not head or head.Transparency == 1 then
+			head = char.Morph and char.Morph:FindFirstChild("SnowHead")
+		end
+		if not head then return end
+		local kit = Instance.new("Folder"); kit.Name = "FaceKit"; kit.Parent = head
+		pd.CurrentPartList.FaceKit = kit
+		local function bit(name,size,pos,color)
+			local p=Instance.new("Part"); p.Name=name; p.Size=size
+			p.Shape=Enum.PartType.Ball; p.Color=color; p.Material=Enum.Material.Neon
+			p.CanCollide,p.CanQuery,p.CanTouch,p.Massless=false,false,false,true
+			local w=Instance.new("Weld"); w.Part0=head; w.Part1=p; w.C0=CFrame.new(pos); w.Parent=p; p.Parent=kit
+			return p
+		end
+		bit("EyeL", Vector3.new(0.18,0.24,0.1), Vector3.new(-0.28,0.25,-0.62), Color3.new(1,1,1))
+		bit("EyeR", Vector3.new(0.18,0.24,0.1), Vector3.new( 0.28,0.25,-0.62), Color3.new(1,1,1))
+		bit("BrowL", Vector3.new(0.26,0.05,0.08), Vector3.new(-0.28,0.47,-0.58), Color3.fromRGB(40,40,45))
+		bit("BrowR", Vector3.new(0.26,0.05,0.08), Vector3.new( 0.28,0.47,-0.58), Color3.fromRGB(40,40,45))
+		local mouth = bit("Mouth", Vector3.new(0.42,0.12,0.08), Vector3.new(0,-0.12,-0.62), Color3.fromRGB(50,30,35))
+		pd.FaceBits = {Mouth=mouth, BrowL=kit.BrowL, BrowR=kit.BrowR}
+	end)
+end
+
+local function UpdateEmotion(pd, char)
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local root = char:FindFirstChild("HumanoidRootPart")
+	if not hum or not root then return end
+	local v = root.AssemblyLinearVelocity
+	local t = "Happy"
+	if Clock() < (pd.HurtUntil or 0) then t = "Angry"
+	elseif hum:GetState() == Enum.HumanoidStateType.Freefall and v.Y < -55 then t = "Scared"
+	elseif Vector3.new(v.X,0,v.Z).Magnitude > 55 then t = "Dizzy" end
+	if t ~= pd.FaceTarget.Emotion then
+		pd.FaceTarget.Emotion = t
+		pcall(function()
+			local bits = pd.FaceBits
+			if bits then
+				local scared = t=="Scared"; local angry=t=="Angry"
+				bits.EyeL = bits.EyeL or (pd.CurrentPartList.FaceKit and pd.CurrentPartList.FaceKit.EyeL)
+				local kit = pd.CurrentPartList.FaceKit
+				if kit then
+					kit.EyeL.Size = scared and Vector3.new(0.24,0.3,0.1) or Vector3.new(0.18,angry and 0.16 or 0.24,0.1)
+					kit.EyeR.Size = scared and Vector3.new(0.24,0.3,0.1) or Vector3.new(0.18,angry and 0.16 or 0.24,0.1)
+				end
+				bits.BrowL.Rotation = angry and CFrame.Angles(0,0,math.rad(22)) or CFrame.Angles(0,0,scared and math.rad(-14) or 0)
+				bits.BrowR.Rotation = angry and CFrame.Angles(0,0,math.rad(-22)) or CFrame.Angles(0,0,scared and math.rad(14) or 0)
+			end
+			local visor = char.Morph and char.Morph:FindFirstChild("EyeVisor")
+			if visor then visor.Color = EMOTION_COLORS[t] end
+		end)
+	end
+	local speed = v.Magnitude
+	pd.FaceTarget.Mouth = 0.35 + math.clamp(speed/70,0,1)*1.1
+		+ (hum:GetState()==Enum.HumanoidStateType.Freefall and 0.5 or 0)
+end
+
+local function TriggerGlitch(pd, dmg)
+	pd.GlitchUntil = Clock() + math.min(CONFIG.GlitchDuration, 0.15 + dmg*0.02)
+	pd.GlitchMag = math.clamp(dmg*0.02, 0.08, 0.5)
+	PlaySound("Glitch", pd.LastRoot, 0.55, 0.3)
+end
+
+local function BindCharacterEvents(char, dataName)
+	local pd = Function.PlayerDataAdd(dataName)
+	for _, c in ipairs(pd.Conns) do pcall(function() c:Disconnect() end) end
+	pd.Conns = {}
+	pd.LastRoot = char:FindFirstChild("HumanoidRootPart")
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if hum then
+		local lastHealth = hum.Health
+		table.insert(pd.Conns, hum.HealthChanged:Connect(function(h)
+			if h < lastHealth - 0.5 then TriggerGlitch(pd, lastHealth - h)
+			elseif h > lastHealth then pd.HurtUntil = 0 end
+			lastHealth = h
+		end))
+		table.insert(pd.Conns, hum.StateChanged:Connect(function(_, new)
+			local sq = pd.SquashSpring
+			local root = pd.LastRoot
+			if new == Enum.HumanoidStateType.Jumping then
+				sq:Impulse(Vector3.new(CONFIG.Squash.JumpKick,0,0)) -- negative = stretch
+				PlaySound("Jump", root, 0.9+math.random()*0.2)
+			elseif new == Enum.HumanoidStateType.Landed then
+				local fall = root and math.abs(root.AssemblyLinearVelocity.Y) or 20
+				sq:Impulse(Vector3.new(CONFIG.Squash.LandKick*math.clamp(fall/50,0.3,1.6),0,0))
+				PlaySound("Land", root, 0.8+math.random()*0.4)
+				local puff = root and GetEmitter(dataName, root, "puff")
+				if puff then puff:Emit(math.random(6,12)) end
+			end
+		end))
+		table.insert(pd.Conns, hum.Died:Connect(function()
+			task.delay(1.5, function() Function.CharacterReset(char, dataName) end)
+		end))
+	end
+end
+--#endregion
+
+--#region ██ COMMANDS ██
+local RecentCmd = {}
+local function DispatchCommand(speakerName, raw)
+	raw = raw:gsub("^%s+","")
+	if raw:sub(1,1) ~= "/" then return end
+	local parts = string.split(raw, " ")
+	local cmd = table.remove(parts, 1):lower()
+	local arg = parts[1]
+	local key = speakerName.."|"..cmd.."|"..(arg or "")
+	if RecentCmd[key] and Clock()-RecentCmd[key] < 1 then return end
+	RecentCmd[key] = Clock()
+
+	local me = Function.PlayerDataAdd(LocalPlayer.Name)
+	local function applySelf() Function.CharacterExecute(LocalPlayer.Character, LocalPlayer.Name) end
+
+	if cmd == "/morph" or cmd == "/execute" then
+		if (arg or ""):lower() == "list" then
+			print("[Morph] Available: "..table.concat(CONFIG.MorphCycleOrder, ", "))
+		elseif arg and PART_LISTS[arg] then
+			me.SelectedMorphName = arg; applySelf()
+		elseif arg and workspace:FindFirstChild(arg) then -- legacy /execute <player>
+			Function.CharacterExecute(workspace[arg].Character or workspace[arg], arg)
+		else
+			warnf("Unknown morph/player: "..tostring(arg))
+		end
+	elseif cmd == "/uv" then me.UVToggle = (arg=="on") or (arg~=nil and arg~="off" and me.UVToggle==false); applySelf()
+	elseif cmd == "/scale" then
+		local n = tonumber(arg)
+		if n then me.MuffinsScale = n; me.DonutsScale = n*50; applySelf() end
+	elseif cmd == "/color" then
+		if arg and arg:match("%d+,%s*%d+,%s*%d+") then
+			local r,g,b = arg:match("(%d+),%s*(%d+),%s*(%d+)")
+			OverrideColorAll(LocalPlayer.Name, Color3.fromRGB(tonumber(r),tonumber(g),tonumber(b)))
+		elseif arg then
+			for i,p in ipairs(CONFIG.ColorPresets) do
+				if p.name:lower()==arg:lower() then me.ColorPresetIndex=i; OverrideColorAll(LocalPlayer.Name, p.c); break end
+			end
+		end
+	elseif cmd == "/quality" then
+		local map={auto=1,low=2,medium=3,high=4}
+		if map[arg] then me.QualityIndex=map[arg]; print("[Morph] Quality → "..arg) end
+	elseif cmd == "/physics" then me.PhysicsOn = not (arg=="off"); print("[Morph] Physics "..(me.PhysicsOn and "ON" or "OFF"))
+	elseif cmd == "/bob" then me.BobOn = not (arg=="off")
+	elseif cmd == "/help" then
+		print([[── Morph Engine commands ──
+/morph <Name|list>  /uv <on|off>  /scale <n>
+/color <Preset|r,g,b>  /quality <auto|low|medium|high>
+/physics <on|off>  /bob <on|off>]])
+	end
+end
+
+local function BindChat()
+	pcall(function()
+		TextChatService.MessageReceived:Connect(function(msg)
+			local src = msg.TextSource
+			if src then task.spawn(DispatchCommand, src.Name, msg.Text) end
+		end)
+	end)
+	pcall(function() -- legacy fallback (older chat systems)
+		Players.PlayerAdded:Connect(function(plr)
+			plr.Chatted:Connect(function(msg) task.spawn(DispatchCommand, plr.Name, msg) end)
+		end)
+		for _,plr in ipairs(Players:GetPlayers()) do
+			plr.Chatted:Connect(function(msg) task.spawn(DispatchCommand, plr.Name, msg) end)
+		end
+	end)
+end
+--#endregion
+
+--#region ██ DRAWING GUI (morph selector + HUD) ██
+local Gui = {Open=false, Items=nil, HoverIdx=0, Dirty=true, Hud=nil, HudDirty=true}
+
+local function DrawingSupported() return type(Drawing) == "table" or type(Drawing) == "userdata" end
+
+local function NewDrawing(class, props)
+	local ok, d = pcall(Drawing.new, class)
+	if not ok then return nil end
+	for k,v in pairs(props) do pcall(function() d[k]=v end) end
+	return d
+end
+
+local function BuildGui()
+	if Gui.Items or not DrawingSupported() then return end
+	local vp = Camera.ViewportSize
+	local bx, by, bw = 24, vp.Y*0.28, 210
+	local rowH, rows = 30, #CONFIG.MorphCycleOrder
+	local bh = rows*rowH + 66
+	local items = {list = {}}
+	items.bg = NewDrawing("Square",{Position=Vector2.new(bx,by), Size=Vector2.new(bw,bh),
+		Color=Color3.fromRGB(18,18,26), Thickness=1, Filled=true, Transparency=0.82, Visible=false})
+	items.title = NewDrawing("Text",{Text="⚡ MORPH ENGINE", Size=16, Center=false,
+		Position=Vector2.new(bx+10,by+8), Color=Color3.fromRGB(120,255,180), Outline=true, Visible=false})
+	for i,name in ipairs(CONFIG.MorphCycleOrder) do
+		local y = by + 34 + (i-1)*rowH
+		local bg = NewDrawing("Square",{Position=Vector2.new(bx+8,y), Size=Vector2.new(bw-16,rowH-4),
+			Color=Color3.fromRGB(38,38,52), Filled=true, Transparency=0.9, Visible=false})
+		local tx = NewDrawing("Text",{Text=name, Size=14, Position=Vector2.new(bx+18,y+7),
+			Color=Color3.fromRGB(230,230,240), Outline=true, Visible=false})
+		items.list[i] = {bg=bg, tx=tx, name=name}
+	end
+	items.hint = NewDrawing("Text",{Text="[G] close · [P] cycle · /help for cmds", Size=12,
+		Position=Vector2.new(bx+8, by+bh-22), Color=Color3.fromRGB(150,150,170), Outline=true, Visible=false})
+	Gui.Items = items
+
+	local hud = {}
+	hud.bg = NewDrawing("Square",{Position=Vector2.new(vp.X-236,14), Size=Vector2.new(222,74),
+		Color=Color3.fromRGB(18,18,26), Filled=true, Transparency=0.75, Visible=false})
+	hud.tx = NewDrawing("Text",{Text="", Size=13, Position=Vector2.new(vp.X-228,20),
+		Color=Color3.fromRGB(190,255,220), Outline=true, Visible=false})
+	Gui.Hud = hud
+end
+
+local function SyncGui()
+	local it = Gui.Items; if not it then return end
+	local pd = Function.PlayerDataAdd(LocalPlayer.Name)
+	local show = Gui.Open
+	it.bg.Visible, it.title.Visible, it.hint.Visible = show, show, show
+	for i,btn in ipairs(it.list) do
+		local sel = pd.SelectedMorphName == btn.name
+		btn.bg.Visible = show
+		btn.tx.Visible = show
+		btn.bg.Color = (Gui.HoverIdx==i) and Color3.fromRGB(70,70,100)
+			or sel and Color3.fromRGB(40,70,58) or Color3.fromRGB(38,38,52)
+		btn.tx.Color = sel and Color3.fromRGB(130,255,190) or Color3.fromRGB(230,230,240)
+	end
+	Gui.Dirty = false
+end
+
+local function GuiHitTest()
+	local it = Gui.Items
+	if not it or not Gui.Open then Gui.HoverIdx=0; return end
+	local m = UserInputService:GetMouseLocation()
+	for i,btn in ipairs(it.list) do
+		local p,s = btn.bg.Position, btn.bg.Size
+		if m.X>=p.X and m.X<=p.X+s.X and m.Y>=p.Y and m.Y<=p.Y+s.Y then
+			if Gui.HoverIdx ~= i then Gui.HoverIdx=i; Gui.Dirty=true end
+			return
+		end
+	end
+	if Gui.HoverIdx ~= 0 then Gui.HoverIdx=0; Gui.Dirty=true end
+end
+
+local function SyncHud()
+	local hud = Gui.Hud; if not hud then return end
+	local pd = Function.PlayerDataAdd(LocalPlayer.Name)
+	local show = pd.HudOn or false
+	local springCount = 0
+	for _ in pairs(pd.CurrentPartList.BodyPartPhysics) do springCount += 1 end
+	hud.bg.Visible, hud.tx.Visible = show, show
+	hud.tx.Text = string.format("Morph: %s\nQuality: %s · FPS: %d\nSprings: %d · UV: %s",
+		pd.SelectedMorphName, pd.QualityIndex==1 and "Auto/"..QualityTier or QUALITY_ORDER[pd.QualityIndex-1],
+		math.floor(FPSAvg), springCount, pd.UVToggle and "ON" or "OFF")
+end
+--#endregion
+
+--#region ██ COLOR OVERRIDE ██
+function OverrideColorAll(dataName, color)
+	local pd = PlayerData[dataName]; if not pd then return end
+	local char = workspace:FindFirstChild(dataName)
+	local torso = char and char:FindFirstChild("Torso")
+	local base = color or (torso and torso.Color)
+	if not base then return end
+	for inst in pairs(pd.CurrentPartList.Organ) do
+		pcall(function()
+			if inst:IsA("BasePart") and not inst.Name:match("UV") and inst.Transparency < 0.9
+				and inst.Material ~= Enum.Material.Neon then
+				inst.Color = base
+			end
+		end)
+	end
+	for decal in pairs(pd.CurrentPartList.FrostingDecal) do
+		pcall(function() decal.Color3 = Function.DarkenColor(base, 0.32) end)
+	end
+end
+--#endregion
+
+--#region ██ MAIN LOOP — RENDER PASS ██
+local RNG = Random.new()
+local function EaseOutBack(t) local c=1.70158; t=t-1; return t*t*((c+1)*t+c)+1 end
+
+RunService.RenderStepped:Connect(function(dt)
+	dt = math.min(dt, CONFIG.MaxFrameDelta)
+	local qLevel = QualityLevel()
+	local now = Clock()
+
+	for dataName, pd in pairs(PlayerData) do
+		local char = workspace:FindFirstChild(dataName)
+		if char and char.PrimaryPart then
+			local root = pd.LastRoot or char:FindFirstChild("HumanoidRootPart")
+			if root then pd.LastRoot = root end
+
+			-- squash & stretch spring (1-D packed in X)
+			local sq = pd.SquashSpring
+			sq.Target = Vector3.zero
+			sq.Speed, sq.Damper = CONFIG.Squash.Speed, CONFIG.Squash.Damper
+			sq:Step(dt)
+			local s = math.clamp(sq.Position.X, -1.4, 1.4) * CONFIG.Squash.Gain
+			local squash = Vector3.new(1 - s*0.5, 1 + s, 1 - s*0.5)
+
+			-- glitch distortion envelope
+			local glitchActive = now < pd.GlitchUntil
+			local gMag = glitchActive and pd.GlitchMag or 0
+			local glitchCF = glitchActive and CFrame.Angles(
+				math.rad(RNG:NextNumber(-gMag,gMag)*40),
+				math.rad(RNG:NextNumber(-gMag,gMag)*40), 0) or CFrame.identity
+
+			-- ready-up progress
+			local readyAlpha = 1
+			if pd.ReadyT0 > 0 then
+				readyAlpha = math.clamp((now - pd.ReadyT0)/0.45, 0, 1)
+				if readyAlpha >= 1 then pd.ReadyT0 = 0 end
+			end
+
+			for inst, entry in pairs(pd.CurrentPartList.RealtimeUpdateList.Mesh) do
+				if not inst.Parent then
+					pd.CurrentPartList.RealtimeUpdateList.Mesh[inst] = nil
+					pd.CurrentPartList.BodyPartPhysics[inst] = nil
+					continue
+				end
+				local base = entry.Base
+				if base and base.Parent then
+					-- refresh multipliers only when the base resized
+					if base.Size ~= entry.BaseSize then
+						entry.BaseSize = base.Size
+						local XM,YM,ZM = Function.MultiplyCalculate(base.Size, BodyPartSize[base.Name])
+						entry.Mult = {X=XM,Y=YM,Z=ZM}
+						entry.RawC0, entry.RawC1 = entry.C0, entry.C1
+						entry.RawSize = entry.RawSize -- unchanged
+					end
+					local m = entry.Mult
+					if not m then
+						local XM,YM,ZM = Function.MultiplyCalculate(base.Size, BodyPartSize[base.Name])
+						entry.Mult = {X=XM,Y=YM,Z=ZM}; m = entry.Mult
+						entry.RawC0, entry.RawC1 = entry.C0, entry.C1
+					end
+					local weld = entry.Weld
+					if weld and weld.Part1 then
+						-- size = raw × limb-mult × physics-squish × global-squash
+						local size = entry.RawSize
+						local sf = entry.SizeFactor
+						weld.Part1.Size = Vector3.new(size.x*m.X*sf.X*squash.X, size.y*m.Y*sf.Y*squash.Y, size.z*m.Z*sf.Z*squash.Z)
+						local mesh = weld.Part1:FindFirstChildOfClass("SpecialMesh")
+						if mesh and mesh.MeshType == Enum.MeshType.FileMesh then
+							mesh.Scale = Vector3.new(size.x*m.X*sf.X*squash.X, size.y*m.Y*sf.Y*squash.Y, size.z*m.Z*sf.Z*squash.Z)
+						end
+
+						-- idle bob
+						local bobCF = CFrame.identity
+						if pd.BobOn and qLevel >= 2 then
+							local amp = entry.BobAmpOverride or CONFIG.IdleBobDefault.Amp
+							local ph = (pd.CurrentPartList.BodyPartPhysics[inst] and pd.CurrentPartList.BodyPartPhysics[inst].Phase) or 0
+							bobCF = CFrame.new(
+								math.sin(now*CONFIG.IdleBobDefault.Speed + ph)*amp*0.4,
+								math.sin(now*CONFIG.IdleBobDefault.Speed*1.3 + ph)*amp, 0)
+						end
+
+						-- ready-up settle (back-eased overshoot + spin decay)
+						local readyCF = CFrame.identity
+						if entry.ReadyOff then
+							if readyAlpha >= 1 then entry.ReadyOff = nil
+							else
+								local e = EaseOutBack(readyAlpha)
+								local o = entry.ReadyOff
+								readyCF = CFrame.new(o.Position * (1-e)) * CFrame.Angles(
+									o:ToEulerAnglesXYZ() and select(1, o:ToEulerAnglesXYZ())*(1-e) or 0, 0, 0)
+							end
+						end
+
+						weld.C0 = entry.C0 * (entry.PhysOffset or CFrame.identity) * bobCF * readyCF * glitchCF
+						weld.C1 = entry.C1
+
+						-- damage flicker
+						if glitchActive then
+							weld.Part1.Transparency = math.clamp(weld.Part1.Transparency,0,1) > 0
+								and RNG:NextNumber(0, gMag) or weld.Part1.Transparency
+						end
+					end
+				end
+			end
+
+			-- face animation (cheap, smoothed)
+			if pd.FaceBits and pd.FaceBits.Mouth.Parent then
+				local mt = pd.FaceTarget.Mouth or 0.5
+				local cur = pd.FaceBits.Mouth.Size.Y
+				local nxt = cur + (mt - cur)*math.min(dt*10,1)
+				pd.FaceBits.Mouth.Size = Vector3.new(0.42, nxt, 0.08)
+			end
+		end
+	end
+
+	if Gui.Open and Gui.Dirty then SyncGui() end
+end)
+--#endregion
+
+--#region ██ MAIN LOOP — PHYSICS PASS (batched, culled, quality-aware) ██
+local StepParity = 0
+RunService.Stepped:Connect(function(_, dt)
+	dt = math.min(dt, CONFIG.MaxFrameDelta)
+	StepParity += 1
+	local qLevel = QualityLevel()
+
+	for dataName, pd in pairs(PlayerData) do
+		local char = workspace:FindFirstChild(dataName)
+		if char and pd.PhysicsOn and pd.BodyPhysics then
+			local base0 = pd.LastRoot or char:FindFirstChild("HumanoidRootPart")
+
+			-- ── camera-aware culling (once per character, not per part)
+			local culled = true
+			if base0 then
+				local camPos = Camera.CFrame.Position
+				local dist = (camPos - base0.Position).Magnitude
+				if dist < CONFIG.MaxViewDistance then
+					local _, onScreen = pcall(function() return Camera:WorldToScreenPoint(base0.Position) end)
+					culled = not (onScreen and onScreen.Z > 0)
+				end
+				if dist > CONFIG.MaxViewDistance * 1.6 then
+					for inst in pairs(pd.CurrentPartList.BodyPartPhysics) do
+						pd.CurrentPartList.BodyPartPhysics[inst].SkipTime = 0
+					end
+				end
+			end
+
+			local phys = pd.CurrentPartList.BodyPartPhysics
+			-- resolve chain links lazily
+			for inst, entry in pairs(phys) do
+				if entry.Chain and not entry.ChainEntry then
+					for other, oe in pairs(phys) do
+						if other.Name == entry.Chain then entry.ChainEntry = oe; break end
+					end
+				end
+			end
+
+			-- two passes: roots first, then chained (built-in response delay)
+			for pass = 1, 2 do
+				for inst, entry in pairs(phys) do
+					local isChained = entry.ChainEntry ~= nil
+					if (pass == 1 and not isChained) or (pass == 2 and isChained) then
+						if not inst.Parent or Function.FallenPartCheck(inst) then
+							phys[inst] = nil
+						elseif not culled and (qLevel >= 2 or StepParity % 2 == 0) then
+							local e = entry
+							local spr = e.Spring
+							e.EntryQ = qLevel
+
+							-- fast-forward after a cull pause
+							if e.SkipTime > 0 then
+								spr:TimeSkip(math.min(e.SkipTime, 0.5))
+								e.SkipTime = 0
+							end
+
+							e.PrevVel = spr.Velocity
+							local baseCF = e.Base.CFrame
+							local origin = e.OriginCFrame
+
+							-- drive impulse: positional lag + look-vector shear (original recipe)
+							local posDist = origin.Position - baseCF.Position
+							local lookDist = origin.LookVector - baseCF.LookVector
+							spr:Impulse(posDist + Vector3.new(lookDist.X, lookDist.Y, 0))
+
+							-- ambient forces: wind noise + chain whip
+							if qLevel >= 2 then
+								local wn = CONFIG.WindNoise * (qLevel == 3 and 1 or 0.5)
+								spr:AddForce(Vector3.new(RNG:NextNumber(-wn,wn), RNG:NextNumber(-wn,wn), RNG:NextNumber(-wn,wn)))
+							end
+							local parent = e.ChainEntry
+							if parent then
+								local f = (parent.PrevVel - spr.Velocity) * (e.Profile.ChainK or 0.4) * 40
+								if f.Magnitude > 140 then f = f.Unit * 140 end
+								spr:AddForce(f)
+							end
+
+							spr:Step(dt)
+
+							-- settle gate
+							local nx, ny, nz = Function.CompareVector3(spr.Velocity, Vector3.new(0.0015,0.0015,0.0015))
+							if nx and ny and nz then
+								e.PhysOffset = CFrame.identity
+								e.SizeFactor = Vector3.one
+							else
+								local posL, rotL = {X=0,Y=0,Z=0}, {X=0,Y=0,Z=0}
+								for from,to in pairs(e.PosOff) do
+									posL[from] = ((e.Profile.PosGain[to] or 0) * spr.Velocity[to]) * CONFIG.PhysicsMultiply.Position
+								end
+								for from,to in pairs(e.RotOff) do
+									rotL[from] = math.rad(e.Profile.RotGain[to] * spr.Velocity[to]) * CONFIG.PhysicsMultiply.Rotation
+								end
+								e.PhysOffset = CFrame.new(posL.X, posL.Y, posL.Z)
+									* CFrame.Angles(rotL.X, rotL.Y, -rotL.Z)
+								if e.Profile.Squish then
+									local sg = e.Profile.SquishGain or 1
+									e.SizeFactor = Vector3.new(
+										math.clamp(1 + rotL.X/4*sg, 0.8, 1.1),
+										math.clamp(1 + rotL.Y/4*sg, 0.8, 1.1),
+										math.clamp(1 + rotL.Z/4*sg, 0.8, 1.1))
+								end
+								-- trails (High quality only)
+								if qLevel == 3 and spr.Velocity.Magnitude > CONFIG.TrailThreshold then
+									local tr = GetEmitter(dataName, inst, "trail")
+									if tr then tr.Enabled = true; tr.Rate = math.min(spr.Velocity.Magnitude*2, 90) end
+								else
+									local tr = GetEmitter(dataName, inst, "trail")
+									if tr then tr.Enabled = false end
+								end
+							end
+
+							e.OriginCFrame = baseCF
+						elseif culled then
+							entry.SkipTime += dt
+						end
+					end
+				end
+			end
+		end
+	end
+end)
+--#endregion
+
+--#region ██ HEARTBEAT — FPS WATCH / EMOTION / FOOTSTEPS / HUD ██
+local fpsFrames, fpsWindow = 0, 0
+local emotionClock = 0
+RunService.Heartbeat:Connect(function(dt)
+	fpsFrames += 1; fpsWindow += dt
+	if fpsWindow >= 0.5 then
+		FPSAvg = fpsFrames / fpsWindow
+		fpsFrames, fpsWindow = 0, 0
+		-- adaptive quality with hysteresis (auto mode)
+		if PlayerData[LocalPlayer.Name] and PlayerData[LocalPlayer.Name].QualityIndex == 1 then
+			if FPSAvg < CONFIG.QualityAutoFPS.Low and QualityTier ~= "Low" then QualityTier = "Low"
+			elseif FPSAvg < CONFIG.QualityAutoFPS.Medium and QualityTier == "High" then QualityTier = "Medium"
+			elseif FPSAvg > CONFIG.QualityAutoFPS.Medium + 12 and QualityTier ~= "High" then QualityTier = "High" end
+			Gui.HudDirty = true
+		end
+	end
+
+	emotionClock += dt
+	if emotionClock >= 0.1 then
+		emotionClock = 0
+		for dataName, pd in pairs(PlayerData) do
+			local char = workspace:FindFirstChild(dataName)
+			if char and (pd.CurrentPartList.FaceKit or char:FindFirstChild("Morph")) then
+				UpdateEmotion(pd, char)
+			end
+			-- footsteps (self only, keeps cost trivial)
+			if dataName == LocalPlayer.Name and char and pd.LastRoot then
+				local hum = char:FindFirstChildOfClass("Humanoid")
+				local root = pd.LastRoot
+				if hum and root and hum.FloorMaterial ~= Enum.Material.Air then
+					local hv = Vector3.new(root.AssemblyLinearVelocity.X, 0, root.AssemblyLinearVelocity.Z)
+					if hv.Magnitude > 4 then
+						pd.FootAccum += hv.Magnitude * dt
+						if pd.FootAccum >= CONFIG.FootstepStride then
+							pd.FootAccum = 0
+							pd.FootSide = -pd.FootSide
+							PlaySound("Step", root, 0.85 + math.random()*0.35)
+							if QualityLevel() >= 2 then
+								local att = GetEmitter(dataName, root, "puff")
+								if att then att:Emit(3) end
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+
+	if Gui.Hud and Gui.HudDirty then Gui.HudDirty = false; SyncHud() end
+end)
+--#endregion
+
+--#region ██ INPUT BINDINGS ██
+local ClickApplyActive = false
+local ClickHighlight = nil
+
+UserInputService.InputBegan:Connect(function(input, gpe)
+	if gpe then return end
+	local pd = Function.PlayerDataAdd(LocalPlayer.Name)
+	local kc = input.KeyCode
+	local function applySelf()
+		if LocalPlayer.Character then Function.CharacterExecute(LocalPlayer.Character, LocalPlayer.Name) end
+	end
+
+	if kc == Enum.KeyCode.C then
+		pd.UVToggle = not pd.UVToggle; applySelf(); warnf("Toggled UV → "..tostring(pd.UVToggle))
+	elseif kc == Enum.KeyCode.RightBracket then
+		pd.MuffinsScale += 0.2; pd.DonutsScale += 5; applySelf()
+		warnf("Scale → muffins "..pd.MuffinsScale.." / donuts "..pd.DonutsScale)
+	elseif kc == Enum.KeyCode.LeftBracket then
+		pd.MuffinsScale = math.max(0.2, pd.MuffinsScale - 0.2)
+		pd.DonutsScale = math.max(5, pd.DonutsScale - 5); applySelf()
+		warnf("Scale → muffins "..pd.MuffinsScale.." / donuts "..pd.DonutsScale)
+	elseif kc == Enum.KeyCode.B then
+		for _, plr in ipairs(Players:GetPlayers()) do
+			if plr.Character then task.spawn(Function.CharacterExecute, plr.Character, plr.Name) end
+		end
+	elseif kc == Enum.KeyCode.P then
+		local order = CONFIG.MorphCycleOrder
+		local idx = table.find(order, pd.SelectedMorphName) or 0
+		pd.SelectedMorphName = order[(idx % #order) + 1]
+		applySelf(); Gui.Dirty = true
+		print("[Morph] → "..pd.SelectedMorphName)
+	elseif kc == Enum.KeyCode.Equals then
+		-- click-to-apply (improved: reusable highlight, = again cancels)
+		if ClickApplyActive then
+			ClickApplyActive = false
+			if ClickHighlight then ClickHighlight:Destroy(); ClickHighlight = nil end
+			return
+		end
+		ClickApplyActive = true
+		ClickHighlight = Instance.new("Highlight")
+		ClickHighlight.FillColor = Color3.fromRGB(120,255,180)
+		local mouse = LocalPlayer:GetMouse()
+		local mvConn
+		mvConn = RunService.RenderStepped:Connect(function()
+			if not ClickApplyActive then mvConn:Disconnect(); return end
+			local tgt = mouse.Target
+			local model = tgt and tgt:FindFirstAncestorOfClass("Model")
+			if model and model:FindFirstChildOfClass("Humanoid") then
+				ClickHighlight.Parent = model
+			elseif ClickHighlight.Parent then
+				ClickHighlight.Parent = nil
+			end
+		end)
+		local clickConn
+		clickConn = mouse.Button1Down:Connect(function()
+			if ClickHighlight and ClickHighlight.Parent then
+				local m = ClickHighlight.Parent
+				Function.CharacterExecute(m, m.Name)
+			end
+			ClickApplyActive = false
+			mvConn:Disconnect(); clickConn:Disconnect()
+			if ClickHighlight then ClickHighlight:Destroy(); ClickHighlight = nil end
+		end)
+	elseif kc == Enum.KeyCode.G then
+		if DrawingSupported() then
+			BuildGui()
+			Gui.Open = not Gui.Open; Gui.Dirty = true; SyncGui()
+		else
+			warnf("Drawing API unavailable — use /morph <Name> instead")
+		end
+	elseif kc == Enum.KeyCode.V then
+		pd.ColorPresetIndex = (pd.ColorPresetIndex % #CONFIG.ColorPresets) + 1
+		local preset = CONFIG.ColorPresets[pd.ColorPresetIndex]
+		OverrideColorAll(LocalPlayer.Name, preset.c)
+		warnf("Color → "..preset.name)
+	elseif kc == Enum.KeyCode.X then
+		pd.QualityIndex = (pd.QualityIndex % 4) + 1
+		local names = {[1]="Auto",[2]="Low",[3]="Medium",[4]="High"}
+		warnf("Quality → "..names[pd.QualityIndex]); Gui.HudDirty = true
+	elseif kc == Enum.KeyCode.N then
+		if LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Morph") then
+			Function.CharacterReset(LocalPlayer.Character, LocalPlayer.Name)
+			warnf("Morph removed (N to re-apply via /morph)")
+		else applySelf() end
+	elseif kc == Enum.KeyCode.M then
+		for _, plr in ipairs(Players:GetPlayers()) do
+			if plr.Character then
+				task.spawn(function()
+					if plr.Character:FindFirstChild("Morph") then
+						Function.CharacterReset(plr.Character, plr.Name)
+					else Function.CharacterExecute(plr.Character, plr.Name) end
+				end)
+			end
+		end
+	elseif kc == Enum.KeyCode.H then
+		pd.HudOn = not pd.HudOn; Gui.HudDirty = true
+	elseif input.UserInputType == Enum.UserInputType.MouseButton1 and Gui.Open and Gui.HoverIdx > 0 then
+		pd.SelectedMorphName = Gui.Items.list[Gui.HoverIdx].name
+		applySelf(); Gui.Dirty = true
+	end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+	if Gui.Open and input.UserInputType == Enum.UserInputType.MouseMovement then
+		GuiHitTest()
+	end
+end)
+--#endregion
+
+--#region ██ LIFECYCLE / EVENT-DRIVEN AUTOAPPLY / UNLOAD ██
+local MasterConns = {}
+
+if CONFIG.AutoApply then
+	table.insert(MasterConns, Players.PlayerAdded:Connect(function(plr)
+		plr.CharacterAdded:Connect(function(ch)
+			ch:WaitForChild("Humanoid", 10)
+			task.wait(0.35)
+			local pd = Function.PlayerDataAdd(plr.Name)
+			Function.CharacterExecute(ch, plr.Name)
+		end)
+	end))
+	for _, plr in ipairs(Players:GetPlayers()) do
+		plr.CharacterAdded:Connect(function(ch)
+			ch:WaitForChild("Humanoid", 10)
+			task.wait(0.35)
+			Function.PlayerDataAdd(plr.Name)
+			Function.CharacterExecute(ch, plr.Name)
+		end)
+	end
+end
+
+table.insert(MasterConns, Players.PlayerRemoving:Connect(function(plr)
+	PlayerData[plr.Name] = nil
+end))
+
+local function Unload()
+	warnf("Unloading…")
+	for _, c in ipairs(MasterConns) do pcall(function() c:Disconnect() end) end
+	for _, plr in ipairs(Players:GetPlayers()) do
+		local pd = PlayerData[plr.Name]
+		if pd then
+			for _, c in ipairs(pd.Conns) do pcall(function() c:Disconnect() end) end
+			local ch = workspace:FindFirstChild(plr.Name)
+			if ch then Function.CharacterReset(ch, plr.Name) end
+		end
+	end
+	if Gui.Items then
+		pcall(function() Gui.Items.bg:Remove() end)
+		pcall(function() Gui.Items.title:Remove() end)
+		pcall(function() Gui.Items.hint:Remove() end)
+		for _, b in ipairs(Gui.Items.list) do b.bg:Remove(); b.tx:Remove() end
+	end
+	if Gui.Hud then Gui.Hud.bg:Remove(); Gui.Hud.tx:Remove() end
+	PlayerData = {}
+	_g.__MorphEngineUnload = nil
+	print("[Morph] Unloaded cleanly.")
+end
+_g.__MorphEngineUnload = Unload
+--#endregion
+
+--#region ██ BOOTSTRAP ██
+-- alias keyed-function names BEFORE BuildPartLists() runs (its data tables
+-- reference createSurfaceAppearance as a constructor-time key)
+createSurfaceAppearance = Function.createSurfaceAppearance
+
+PART_LISTS = BuildPartLists()
+
+Function.PlayerDataAdd(LocalPlayer.Name)
+BindChat()
+
+if LocalPlayer.Character then
+	task.wait(0.5)
+	Function.CharacterExecute(LocalPlayer.Character, LocalPlayer.Name)
+end
+
+print([[
+╔══════════════════════════════════════════════╗
+║   ULTIMATE MORPH ENGINE v2.0 loaded          ║
+║   C=UV  [/]=scale  B=all  P=cycle  =click    ║
+║   G=menu  V=color  X=quality  N=remove       ║
+║   M=all-toggle  H=hud  /help = chat cmds     ║
+╚══════════════════════════════════════════════╝]])
+--#endregion
