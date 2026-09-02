@@ -1,4 +1,4 @@
-Local PartCreator = {}
+local PartCreator = {}
 
 local Function = {}
 
