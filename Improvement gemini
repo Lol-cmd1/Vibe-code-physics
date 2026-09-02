@@ -32,7 +32,7 @@ function run(Player)
 			RestGapFactor = 0.85, 
 			Repulse  = 0.80,      
 			Squash   = 0.20,      
-			MaxOffset   = 1.30,
+			MaxOffset   = 0.30,
 			MaxRotation = 0.55,
 			Variance = 0.06,      
 		},
