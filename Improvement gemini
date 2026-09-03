@@ -16,7 +16,7 @@ function run(Player)
 	-- ============================================================
 	local PhysicsConfig = {
 		Breast = {
-			Speed  = { 4.5, 5.0, 4.25 },
+			Speed  = { 9.0, 10.0, 8.5 },
 			Damper = { 0.55, 0.60, 0.50 },
 			RotSpeed  = { 7.0, 7.0, 7.0 },
 			RotDamper = { 0.60, 0.60, 0.60 },
@@ -25,14 +25,14 @@ function run(Player)
 			Drag    = 0.05,   
 			RotDrag = 0.0005,
 			Jiggle = 0.12, JigSpeed = 16, JigDamper = 0.4,
-			AxisGain    = Vector3.new(1.0, 1.0, 1.0),
+			AxisGain    = Vector3.new(1.0, 1.15, 0.9),
 			RotAxisGain = Vector3.new(1.0, 0.75, 0.9),
 			Coupling = 0.25,      
 			Sync     = 0.10,      
 			RestGapFactor = 0.85, 
 			Repulse  = 0.80,      
 			Squash   = 0.20,      
-			MaxOffset   = 0.30,
+			MaxOffset   = 1.30,
 			MaxRotation = 0.55,
 			Variance = 0.06,      
 		},
@@ -2880,8 +2880,9 @@ function run(Player)
 		local cfg = VaryCfg(PhysicsConfig.Breast, variance)
 
 		Function.SpringCreate(ObjectInstance, Torso, Data, side, "Breast", cfg, {
-			PositionOffset = { X = "Y", Y = "Z", Z = "X" },
-			RotationOffset = { X = "Y", Y = "Z", Z = "X" },
+			-- THE FIX: X maps to X, Y maps to Y, Z maps to Z
+			PositionOffset = { X = "X", Y = "Y", Z = "Z" },
+			RotationOffset = { X = "X", Y = "Y", Z = "Z" },
 		})
 	end
 
@@ -2894,8 +2895,9 @@ function run(Player)
 		for k, v in pairs(PhysicsConfig.UV) do cfg[k] = v end
 
 		Function.SpringCreate(ObjectInstance, Torso, Data, "None", "UV", cfg, {
-			PositionOffset = { X = "Y", Y = "Z", Z = "X" },
-			RotationOffset = { X = "Y", Y = "Z", Z = "Z" },
+			-- THE FIX: X maps to X, Y maps to Y, Z maps to Z
+			PositionOffset = { X = "X", Y = "Y", Z = "Z" },
+			RotationOffset = { X = "X", Y = "Y", Z = "Z" },
 		})
 	end
 
