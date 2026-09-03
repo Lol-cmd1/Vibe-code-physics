@@ -20,7 +20,7 @@ function run(Player)
 			Damper = { 0.55, 0.60, 0.50 },
 			RotSpeed  = { 7.0, 7.0, 7.0 },
 			RotDamper = { 0.60, 0.60, 0.60 },
-			Kick    = 0.15,   
+			Kick    = 0.30,   
 			RotKick = 0.15,   
 			Drag    = 0.05,   
 			RotDrag = 0.0005,
@@ -32,7 +32,7 @@ function run(Player)
 			RestGapFactor = 0.85, 
 			Repulse  = 0.80,      
 			Squash   = 0.20,      
-			MaxOffset   = 0.30,
+			MaxOffset   = 1.30,
 			MaxRotation = 0.55,
 			Variance = 0.06,      
 		},
@@ -3434,31 +3434,44 @@ function run(Player)
 		end
 	end
 
+	-- ============================================================
+	--  SHARED BASELINE UPDATER
+	--  Recomputes the scaled weld C0/C1 from a RealtimeUpdateList entry.
+	--  Used BOTH by RenderStepped (synchronously) and by the physics loop
+	--  (Stepped) so the spring baseline is always THIS frame's value.
+	-- ============================================================
+	local function ComputeScaledBase(Property)
+		local Base = Property.Base
+		local CFRAME = Property.CFrame
+		local CFRAME1 = Property.CFrame1
+
+		local XMultiply, YMultiply, ZMultiply = Function.MultiplyCalculate(Base.Size, BodyPartSize[Base.Name])
+
+		local CCFRAME = CFrame.new(CFRAME.Position.x * XMultiply, CFRAME.Position.y * YMultiply, CFRAME.Position.z * ZMultiply) * CFRAME.Rotation
+		local CCFRAME1 = CFrame.new(CFRAME1.Position.x * XMultiply, CFRAME1.Position.y * YMultiply, CFRAME1.Position.z * ZMultiply) * CFRAME1.Rotation
+
+		return CCFRAME, CCFRAME1, XMultiply, YMultiply, ZMultiply
+	end
+
+	-- ============================================================
+	--  BASELINE / VISUAL UPDATE (synchronous, no task.spawn)
+	--  The CF update must execute inside the RenderStepped callback so that
+	--  another RunService callback never reads a stale value.
+	-- ============================================================
 	local RenderConnect = RunService.RenderStepped:Connect(function()
 		for PlayerName, DataList in pairs(PlayerData) do
 			for Part, Property in pairs(DataList.CurrentPartList.RealtimeUpdateList.Mesh) do
 
-				task.spawn(function()
-					local Base = Property.Base
-					local CFRAME = Property.CFrame
-					local CFRAME1 = Property.CFrame1
-					local SIZE = Property.Size
-					local Weld = Property.Weld
+				local CCFRAME, CCFRAME1, XMultiply, YMultiply, ZMultiply = ComputeScaledBase(Property)
 
-					local XMultiply, YMultiply, ZMultiply = Function.MultiplyCalculate(Base.Size, BodyPartSize[Base.Name])
-					local CCFRAME = CFrame.new(CFRAME.Position.x * XMultiply, CFRAME.Position.y * YMultiply, CFRAME.Position.z * ZMultiply) * CFRAME.Rotation
-					local CCFRAME1 = CFrame.new(CFRAME1.Position.x * XMultiply, CFRAME1.Position.y * YMultiply, CFRAME1.Position.z * ZMultiply) * CFRAME1.Rotation
-
-					if PlayerData[PlayerName].CurrentPartList.BodyPartPhysics[Part] == nil then
-						Part.Size = Vector3.new(SIZE.x * XMultiply, SIZE.y * YMultiply, SIZE.z * ZMultiply)
-						Weld.C0 = CCFRAME
-						Weld.C1 = CCFRAME1
-
-					else
-						PlayerData[PlayerName].CurrentPartList.BodyPartPhysics[Part].CF = CCFRAME
-						PlayerData[PlayerName].CurrentPartList.BodyPartPhysics[Part].CF1 = CCFRAME1
-					end
-				end)
+				if PlayerData[PlayerName].CurrentPartList.BodyPartPhysics[Part] == nil then
+					Part.Size = Vector3.new(Property.Size.x * XMultiply, Property.Size.y * YMultiply, Property.Size.z * ZMultiply)
+					Property.Weld.C0 = CCFRAME
+					Property.Weld.C1 = CCFRAME1
+				else
+					PlayerData[PlayerName].CurrentPartList.BodyPartPhysics[Part].CF = CCFRAME
+					PlayerData[PlayerName].CurrentPartList.BodyPartPhysics[Part].CF1 = CCFRAME1
+				end
 			end
 		end
 	end)
@@ -3486,26 +3499,31 @@ function run(Player)
 				TState = {}
 				DataList.TorsoState = TState
 			end
-			
-			-- Use Roblox's built-in engine momentum instead of frame-by-frame CFrame math
-			local vel = Root.AssemblyLinearVelocity
-			local angVel = Root.AssemblyAngularVelocity
-			
-			-- Smooth the velocity out slightly
-			vel = TState.Vel and TState.Vel:Lerp(vel, 0.45) or vel
-			angVel = TState.AngVel and TState.AngVel:Lerp(angVel, 0.45) or angVel
 
-			local accel = (vel - (TState.LastVel or vel)) / dt
-			accel = TState.Accel and TState.Accel:Lerp(accel, 0.5) or accel
+			-- Use Roblox's built-in engine momentum instead of frame-by-frame CFrame math.
+			-- RAW velocity feeds the response path so movement reacts immediately;
+			-- smoothing is kept ONLY for the gentle drag/stabilization targets.
+			local rawVel = Root.AssemblyLinearVelocity
+			local rawAngVel = Root.AssemblyAngularVelocity
 
-			TState.LastVel = vel
-			TState.Vel = vel
-			TState.AngVel = angVel
+			-- Light smoothing pass (0.9 = 90% toward raw this frame) for drag targets only.
+			local smoothVel = TState.Vel and TState.Vel:Lerp(rawVel, 0.9) or rawVel
+			local smoothAngVel = TState.AngVel and TState.AngVel:Lerp(rawAngVel, 0.9) or rawAngVel
+
+			-- Acceleration is derived from RAW velocity (no stacked lerp latency).
+			local rawAccel = (rawVel - (TState.LastVel or rawVel)) / dt
+			-- One single moderate smoothing pass; 0.75 keeps noise down without lagging a step.
+			local accel = TState.Accel and TState.Accel:Lerp(rawAccel, 0.75) or rawAccel
+
+			TState.LastVel = rawVel
+			TState.Vel = smoothVel
+			TState.AngVel = smoothAngVel
 			TState.Accel = accel
 
 			local invRot = Root.CFrame.Rotation:Inverse()
 			local accelLocal = ClampVector(invRot * accel, 35)
-			local angVelLocal = ClampVector(invRot * angVel, 6)
+			local angVelLocal = ClampVector(invRot * rawAngVel, 6)
+			local smoothAngVelLocal = ClampVector(invRot * smoothAngVel, 6)
 
 			if not TState.Paired then
 				local groups = {}
@@ -3530,6 +3548,21 @@ function run(Player)
 				TState.Paired = true
 			end
 
+			-- The RenderStepped handler fires AFTER Stepped within the same frame,
+			-- so the CF baseline written there is one frame old by the time this
+			-- loop runs. Rebuild it here from the LIVE Base so every spring builds
+			-- its offset on the CURRENT-frame baseline (no stale-frame lag).
+			local RealtimeMesh = DataList.CurrentPartList.RealtimeUpdateList.Mesh
+			for Part2, Prop2 in pairs(PList) do
+				if Prop2.Type ~= "SpringRig" then continue end
+				local Entry = RealtimeMesh[Part2]
+				if Entry then
+					local CCFRAME, CCFRAME1 = ComputeScaledBase(Entry)
+					Prop2.CF = CCFRAME
+					Prop2.CF1 = CCFRAME1
+				end
+			end
+
 			for Part, Prop in pairs(PList) do
 				if Prop.Type ~= "SpringRig" then continue end
 				if Function.FallenPartCheck(Part) then
@@ -3543,6 +3576,7 @@ function run(Player)
 				Prop.Rot:TimeSkip(dt)
 				if Prop.Jig then Prop.Jig:TimeSkip(dt) end
 
+				-- Impulses feed on the RAW (near-live) acceleration / angular velocity.
 				Prop.Pos:ImpulseMapped(Prop.PosMap, accelLocal * (Cfg.Kick * n))
 				Prop.Rot:ImpulseMapped(Prop.RotMap, angVelLocal * (Cfg.RotKick * n))
 
@@ -3550,8 +3584,9 @@ function run(Player)
 					Prop.Jig:ImpulseMapped(Prop.PosMap, accelLocal * (Cfg.Jiggle * n * 2.5))
 				end
 
-				Prop.Pos:SetTargets(MapVector(Prop.PosMap, vel * (-Cfg.Drag)))
-				Prop.Rot:SetTargets(MapVector(Prop.RotMap, angVelLocal * Cfg.RotDrag))
+				-- Drag/stabilization targets keep the lightweight smoothing.
+				Prop.Pos:SetTargets(MapVector(Prop.PosMap, smoothVel * (-Cfg.Drag)))
+				Prop.Rot:SetTargets(MapVector(Prop.RotMap, smoothAngVelLocal * Cfg.RotDrag))
 			end
 
 			for Part, Prop in pairs(PList) do
